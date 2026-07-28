@@ -6,6 +6,7 @@ file(GLOB SURGE_XT_JUCE_RESOURCES_GLOB
   ${CMAKE_SOURCE_DIR}/resources/fonts/Lato*ttf
   ${CMAKE_SOURCE_DIR}/resources/fonts/IndieFlower.ttf
   ${CMAKE_SOURCE_DIR}/resources/fonts/FiraMono-Regular.ttf
+  "${CMAKE_SOURCE_DIR}/resources/data/patches_factory/Templates/Init Saw.fxp"
   ${CMAKE_SOURCE_DIR}/resources/surge-xt/memory-skin.xml
   ${CMAKE_SOURCE_DIR}/resources/surge-xt/wtfile_icon.svg
   ${CMAKE_SOURCE_DIR}/resources/surge-xt/wtscript_icon.svg

@@ -28,7 +28,12 @@
 #include "SurgeJUCELookAndFeel.h"
 #include "RuntimeFont.h"
 #include "AccessibleHelpers.h"
+#include "PatchFileHeaderStructs.h"
+#include "SurgeXTBinary.h"
+#include "dsp/oscillators/ClassicOscillator.h"
+#include "sst/basic-blocks/mechanics/endian-ops.h"
 #include <version.h>
+#include <cstring>
 #include "gui/widgets/CurrentFxDisplay.h"
 #include "gui/widgets/MainFrame.h"
 
@@ -201,7 +206,7 @@ SurgeSynthEditor::SurgeSynthEditor(SurgeSynthProcessor &p)
     assistantButton->setColour(juce::TextButton::textColourOnId, juce::Colours::black);
     assistantButton->setColour(juce::TextButton::textColourOffId, juce::Colours::black);
     assistantButton->setMouseClickGrabsKeyboardFocus(false);
-    assistantButton->onClick = [this]() { applyMockAssistantPlan(); };
+    assistantButton->onClick = [this]() { submitAssistantPrompt(); };
 
     auto promptEditor = std::make_unique<AssistantPromptEditor>("Assistant prompt");
     promptEditor->onFocusChanged = [this](bool hasFocus) { setAssistantPromptFocus(hasFocus); };
@@ -214,22 +219,23 @@ SurgeSynthEditor::SurgeSynthEditor(SurgeSynthProcessor &p)
     assistantPrompt->setColour(juce::TextEditor::backgroundColourId, juce::Colour(28, 28, 28));
     assistantPrompt->setColour(juce::TextEditor::textColourId, juce::Colours::white);
     assistantPrompt->setColour(juce::TextEditor::outlineColourId, juce::Colour(90, 90, 90));
-    assistantPrompt->setColour(juce::TextEditor::focusedOutlineColourId, juce::Colour(240, 160, 35));
+    assistantPrompt->setColour(juce::TextEditor::focusedOutlineColourId,
+                               juce::Colour(240, 160, 35));
     assistantPrompt->setTextToShowWhenEmpty(
-        "Describe a sound or ask for a change to the current patch...", juce::Colour(180, 180, 180));
+        "Describe a sound or ask for a change to the current patch...",
+        juce::Colour(180, 180, 180));
     Surge::Widgets::fixupJuceTextEditorAccessibility(*assistantPrompt);
-    assistantPrompt->onReturnKey = [this]() { applyMockAssistantPlan(); };
+    assistantPrompt->onReturnKey = [this]() { submitAssistantPrompt(); };
     addAndMakeVisible(*assistantPrompt);
 
-    assistantStatus = std::make_unique<juce::Label>("Assistant status", "Offline mock provider");
+    assistantStatus = std::make_unique<juce::Label>("Assistant status", "Local patch generator");
     assistantStatus->setJustificationType(juce::Justification::topLeft);
     assistantStatus->setColour(juce::Label::textColourId, juce::Colours::white);
     assistantStatus->setColour(juce::Label::backgroundColourId, juce::Colour(24, 24, 24));
     assistantStatus->setOpaque(true);
     assistantStatus->setFont(juce::Font(12.0f));
-    assistantStatus->setText(
-        "Describe a sound, or ask for a change to the current patch. Your next request builds on it.",
-        juce::dontSendNotification);
+    assistantStatus->setText("Local prototype: try \"casio retro keyboard sound\".",
+                             juce::dontSendNotification);
     addAndMakeVisible(*assistantStatus);
 
     auto mcValue = Surge::Storage::getUserDefaultValue(&(this->processor.surge->storage),
@@ -434,6 +440,16 @@ void SurgeSynthEditor::paint(juce::Graphics &g)
 
 void SurgeSynthEditor::idle()
 {
+    if (assistantPatchPending)
+    {
+        if (!processor.surge->rawLoadEnqueued.load() && processor.surge->patch_loaded)
+        {
+            assistantPatchPending = false;
+            assistantButton->setEnabled(true);
+            applyCasioRetroKeyboardPatch();
+        }
+    }
+
     sge->idle();
 
     if (processor.surge->refresh_vkb)
@@ -498,16 +514,16 @@ void SurgeSynthEditor::resized()
     drawExtendedControls = sge->getShowVirtualKeyboard();
 
     auto w = getWidth();
-    auto h = getHeight() - assistantBarHeight - assistantResponseHeight -
-             (drawExtendedControls ? 0.01 * sge->getZoomFactor() * extraYSpaceForVirtualKeyboard : 0);
+    auto h =
+        getHeight() - assistantBarHeight - assistantResponseHeight -
+        (drawExtendedControls ? 0.01 * sge->getZoomFactor() * extraYSpaceForVirtualKeyboard : 0);
 
     auto assistantBar = getLocalBounds().withHeight(assistantBarHeight).reduced(8, 6);
     assistantButton->setBounds(assistantBar.removeFromRight(176));
     assistantBar.removeFromRight(8);
     assistantPrompt->setBounds(assistantBar);
-    assistantPrompt->setIndents(8, std::max(0, (assistantPrompt->getHeight() -
-                                                   assistantPrompt->getTextHeight()) /
-                                                  2));
+    assistantPrompt->setIndents(
+        8, std::max(0, (assistantPrompt->getHeight() - assistantPrompt->getTextHeight()) / 2));
     assistantStatus->setBounds(getLocalBounds()
                                    .withTop(assistantBarHeight)
                                    .withHeight(assistantResponseHeight)
@@ -524,9 +540,10 @@ void SurgeSynthEditor::resized()
                 {
                     auto b = getLocalBounds();
                     auto xw = 1.f * sge->getWindowSizeX() / b.getWidth();
-                    auto xh = 1.f * (sge->getWindowSizeY() +
-                                     (drawExtendedControls ? extraYSpaceForVirtualKeyboard : 0) +
-                                     assistantBarHeight + assistantResponseHeight) /
+                    auto xh = 1.f *
+                              (sge->getWindowSizeY() +
+                               (drawExtendedControls ? extraYSpaceForVirtualKeyboard : 0) +
+                               assistantBarHeight + assistantResponseHeight) /
                               b.getHeight();
 
                     auto nz = std::min(1.0 / xw, 1.0 / xh);
@@ -664,8 +681,15 @@ void SurgeSynthEditor::resized()
     }
 }
 
-void SurgeSynthEditor::applyMockAssistantPlan()
+void SurgeSynthEditor::submitAssistantPrompt()
 {
+    if (assistantPatchPending)
+    {
+        assistantStatus->setText("The assistant is already creating a patch.",
+                                 juce::dontSendNotification);
+        return;
+    }
+
     auto prompt = assistantPrompt->getText().trim();
     if (prompt.isEmpty())
     {
@@ -673,18 +697,166 @@ void SurgeSynthEditor::applyMockAssistantPlan()
         return;
     }
 
-    // M1 uses a deterministic plan so the AU workflow can be tested without an API key.
+    auto request = prompt.toLowerCase();
+    auto isCasioRequest =
+        request.contains("casio") || (request.contains("retro") && request.contains("keyboard"));
+    if (!isCasioRequest)
+    {
+        assistantStatus->setText(
+            "This local prototype currently supports: casio retro keyboard sound.",
+            juce::dontSendNotification);
+        return;
+    }
+
+    auto *synth = processor.surge.get();
+    const auto *presetData = SurgeXTBinary::Init_Saw_fxp;
+    constexpr auto headerSize = sizeof(sst::io::fxChunkSetCustom);
+    constexpr auto presetSize = static_cast<std::size_t>(SurgeXTBinary::Init_Saw_fxpSize);
+    if (presetSize <= headerSize)
+    {
+        assistantStatus->setText("The assistant's embedded patch template is invalid.",
+                                 juce::dontSendNotification);
+        return;
+    }
+
+    sst::io::fxChunkSetCustom presetHeader{};
+    std::memcpy(&presetHeader, presetData, headerSize);
+
+    auto chunkSize = sst::basic_blocks::mechanics::endian_read_int32BE(presetHeader.chunkSize);
+    auto validPreset =
+        chunkSize > 0 && static_cast<std::size_t>(chunkSize) <= presetSize - headerSize &&
+        sst::basic_blocks::mechanics::endian_read_int32BE(presetHeader.chunkMagic) == 'CcnK' &&
+        sst::basic_blocks::mechanics::endian_read_int32BE(presetHeader.fxMagic) == 'FPCh' &&
+        sst::basic_blocks::mechanics::endian_read_int32BE(presetHeader.fxID) == 'cjs3';
+    if (!validPreset)
+    {
+        assistantStatus->setText("The assistant's embedded patch template is invalid.",
+                                 juce::dontSendNotification);
+        return;
+    }
+
     sge->undoManager()->pushPatch();
-    auto &patch = processor.surge->storage.getPatch();
-    auto cutoff = processor.surge->idForParameter(&patch.scene[0].filterunit[0].cutoff);
-    auto resonance = processor.surge->idForParameter(&patch.scene[0].filterunit[0].resonance);
-    processor.surge->setParameter01(cutoff, 0.78f, true);
-    processor.surge->setParameter01(resonance, 0.18f, true);
-    processor.surge->storage.getPatch().isDirty = true;
+    synth->patch_loaded = false;
+    assistantPatchPending = true;
+    assistantButton->setEnabled(false);
+    assistantStatus->setText("Creating a Casio-style retro keyboard patch...",
+                             juce::dontSendNotification);
+    synth->enqueuePatchForLoad(presetData + headerSize, chunkSize);
+    synth->processAudioThreadOpsWhenAudioEngineUnavailable();
+}
+
+void SurgeSynthEditor::applyCasioRetroKeyboardPatch()
+{
+    auto *synth = processor.surge.get();
+    auto &patch = synth->storage.getPatch();
+    auto &scene = patch.scene[0];
+
+    auto setValue = [synth](Parameter &parameter, float value) {
+        synth->setParameter01(synth->idForParameter(&parameter),
+                              parameter.value_to_normalized(value), true);
+    };
+
+    setValue(patch.scene_active, 0);
+    setValue(patch.scenemode, sm_single);
+    setValue(patch.character, cm_bright);
+    setValue(patch.volume, -6.0f);
+    setValue(patch.fx_bypass, fxb_all_fx);
+
+    for (auto &effect : patch.fx)
+    {
+        setValue(effect.type, fxt_off);
+    }
+
+    setValue(scene.octave, 0);
+    setValue(scene.pitch, 0.0f);
+    setValue(scene.polymode, pm_poly);
+    setValue(scene.portamento, scene.portamento.val_min.f);
+    setValue(scene.fm_switch, fm_off);
+    setValue(scene.drift, 0.025f);
+    setValue(scene.volume, 0.86f);
+    setValue(scene.pan, 0.0f);
+    setValue(scene.width, 0.55f);
+    setValue(scene.vca_level, -3.0f);
+    setValue(scene.vca_velsense, -15.0f);
+
+    auto &osc1 = scene.osc[0];
+    setValue(osc1.type, ot_classic);
+    setValue(osc1.octave, 0);
+    setValue(osc1.pitch, 0.0f);
+    setValue(osc1.keytrack, 1);
+    setValue(osc1.retrigger, 1);
+    setValue(osc1.p[ClassicOscillator::co_shape], 1.0f);
+    setValue(osc1.p[ClassicOscillator::co_width1], 0.5f);
+    setValue(osc1.p[ClassicOscillator::co_width2], 0.5f);
+    setValue(osc1.p[ClassicOscillator::co_mainsubmix], 0.18f);
+    setValue(osc1.p[ClassicOscillator::co_sync], 0.0f);
+    setValue(osc1.p[ClassicOscillator::co_unison_detune], 0.1f);
+    setValue(osc1.p[ClassicOscillator::co_unison_voices], 1);
+
+    auto &osc2 = scene.osc[1];
+    setValue(osc2.type, ot_classic);
+    setValue(osc2.octave, 1);
+    setValue(osc2.pitch, 0.04f);
+    setValue(osc2.keytrack, 1);
+    setValue(osc2.retrigger, 1);
+    setValue(osc2.p[ClassicOscillator::co_shape], 0.72f);
+    setValue(osc2.p[ClassicOscillator::co_width1], 0.34f);
+    setValue(osc2.p[ClassicOscillator::co_width2], 0.34f);
+    setValue(osc2.p[ClassicOscillator::co_mainsubmix], 0.0f);
+    setValue(osc2.p[ClassicOscillator::co_sync], 0.0f);
+    setValue(osc2.p[ClassicOscillator::co_unison_detune], 0.035f);
+    setValue(osc2.p[ClassicOscillator::co_unison_voices], 2);
+
+    setValue(scene.level_o1, 0.78f);
+    setValue(scene.level_o2, 0.24f);
+    setValue(scene.mute_o1, 0);
+    setValue(scene.mute_o2, 0);
+    setValue(scene.mute_o3, 1);
+    setValue(scene.mute_noise, 1);
+    setValue(scene.mute_ring_12, 1);
+    setValue(scene.mute_ring_23, 1);
+    setValue(scene.route_o1, 1);
+    setValue(scene.route_o2, 1);
+
+    setValue(scene.filterblock_configuration, fc_serial1);
+    setValue(scene.filterunit[0].type, sst::filters::fut_lp12);
+    setValue(scene.filterunit[0].subtype, 0);
+    setValue(scene.filterunit[0].cutoff, 38.0f);
+    setValue(scene.filterunit[0].resonance, 0.12f);
+    setValue(scene.filterunit[0].envmod, 19.0f);
+    setValue(scene.filterunit[0].keytrack, 0.35f);
+    setValue(scene.filterunit[1].type, sst::filters::fut_none);
+    setValue(scene.feedback, 0.0f);
+    setValue(scene.filter_balance, 0.0f);
+    setValue(scene.lowcut, scene.lowcut.val_min.f);
+
+    auto setEnvelope = [&setValue](ADSRStorage &envelope, float attack, float decay, float sustain,
+                                   float release) {
+        setValue(envelope.a, attack);
+        setValue(envelope.d, decay);
+        setValue(envelope.s, sustain);
+        setValue(envelope.r, release);
+        setValue(envelope.a_s, 1);
+        setValue(envelope.d_s, 1);
+        setValue(envelope.r_s, 1);
+        setValue(envelope.mode, emt_digital);
+    };
+
+    setEnvelope(scene.adsr[adsr_ampeg], -8.0f, -0.8f, 0.42f, -2.0f);
+    setEnvelope(scene.adsr[adsr_filteg], -8.0f, -1.4f, 0.08f, -2.5f);
+
+    patch.name = "Casio Retro Keyboard";
+    patch.category = "Assistant";
+    patch.author = "Surge XT Assistant";
+    patch.comment = "Generated locally from the prompt: casio retro keyboard sound";
+    patch.tags.clear();
+    patch.isDirty = true;
+    synth->patchChanged = true;
+    sge->queueRebuildUI();
 
     assistantStatus->toFront(false);
     assistantStatus->setText(
-        "Applied to current patch: cutoff 78%, resonance 18%. Undo is available in Surge.",
+        "Created Casio Retro Keyboard: pulse layers, plucky envelopes, and a low-pass filter.",
         juce::dontSendNotification);
 }
 

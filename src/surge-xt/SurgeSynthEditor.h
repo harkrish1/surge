@@ -111,8 +111,10 @@ class SurgeSynthEditor : public juce::AudioProcessorEditor,
     std::unique_ptr<juce::Label> assistantStatus;
     std::unique_ptr<juce::Component> topLevelContainer;
     bool assistantPromptHasFocus{false};
+    bool assistantPatchPending{false};
 
-    void applyMockAssistantPlan();
+    void submitAssistantPrompt();
+    void applyCasioRetroKeyboardPatch();
     void setAssistantPromptFocus(bool hasFocus);
 
     void setPitchModSustainGUI(int pitch, int mod, int sus);
