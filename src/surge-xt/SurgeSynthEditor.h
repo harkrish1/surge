@@ -46,6 +46,8 @@ class SurgeSynthEditor : public juce::AudioProcessorEditor,
     ~SurgeSynthEditor();
 
     static constexpr int extraYSpaceForVirtualKeyboard = 50;
+    static constexpr int assistantBarHeight = 42;
+    static constexpr int assistantResponseHeight = 24;
 
     //==============================================================================
     void paint(juce::Graphics &) override;
@@ -104,7 +106,14 @@ class SurgeSynthEditor : public juce::AudioProcessorEditor,
     std::unique_ptr<juce::MidiKeyboardComponent> keyboard;
     std::unique_ptr<juce::Label> tempoLabel, sustainLabel;
     std::unique_ptr<juce::TextEditor> tempoTypein;
+    std::unique_ptr<juce::TextButton> assistantButton;
+    std::unique_ptr<juce::TextEditor> assistantPrompt;
+    std::unique_ptr<juce::Label> assistantStatus;
     std::unique_ptr<juce::Component> topLevelContainer;
+    bool assistantPromptHasFocus{false};
+
+    void applyMockAssistantPlan();
+    void setAssistantPromptFocus(bool hasFocus);
 
     void setPitchModSustainGUI(int pitch, int mod, int sus);
 

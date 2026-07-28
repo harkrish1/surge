@@ -32,6 +32,25 @@
 #include "gui/widgets/CurrentFxDisplay.h"
 #include "gui/widgets/MainFrame.h"
 
+struct AssistantPromptEditor : public juce::TextEditor
+{
+    using juce::TextEditor::TextEditor;
+
+    std::function<void(bool)> onFocusChanged = [](bool) {};
+
+    void focusGained(FocusChangeType cause) override
+    {
+        juce::TextEditor::focusGained(cause);
+        onFocusChanged(true);
+    }
+
+    void focusLost(FocusChangeType cause) override
+    {
+        juce::TextEditor::focusLost(cause);
+        onFocusChanged(false);
+    }
+};
+
 struct VKeyboardWheel : public juce::Component
 {
     std::function<void(int)> onValueChanged = [](int f) {};
@@ -175,6 +194,44 @@ SurgeSynthEditor::SurgeSynthEditor(SurgeSynthProcessor &p)
 
     sge = std::make_unique<SurgeGUIEditor>(this, processor.surge.get());
 
+    assistantButton = std::make_unique<juce::TextButton>("Ask assistant");
+    addAndMakeVisible(*assistantButton);
+    assistantButton->setColour(juce::TextButton::buttonColourId, juce::Colour(238, 155, 30));
+    assistantButton->setColour(juce::TextButton::buttonOnColourId, juce::Colour(255, 185, 60));
+    assistantButton->setColour(juce::TextButton::textColourOnId, juce::Colours::black);
+    assistantButton->setColour(juce::TextButton::textColourOffId, juce::Colours::black);
+    assistantButton->setMouseClickGrabsKeyboardFocus(false);
+    assistantButton->onClick = [this]() { applyMockAssistantPlan(); };
+
+    auto promptEditor = std::make_unique<AssistantPromptEditor>("Assistant prompt");
+    promptEditor->onFocusChanged = [this](bool hasFocus) { setAssistantPromptFocus(hasFocus); };
+    assistantPrompt = std::move(promptEditor);
+    assistantPrompt->setMultiLine(false);
+    assistantPrompt->setWantsKeyboardFocus(true);
+    assistantPrompt->setMouseClickGrabsKeyboardFocus(true);
+    assistantPrompt->setFont(juce::Font(16.0f));
+    assistantPrompt->setJustification(juce::Justification::centredLeft);
+    assistantPrompt->setColour(juce::TextEditor::backgroundColourId, juce::Colour(28, 28, 28));
+    assistantPrompt->setColour(juce::TextEditor::textColourId, juce::Colours::white);
+    assistantPrompt->setColour(juce::TextEditor::outlineColourId, juce::Colour(90, 90, 90));
+    assistantPrompt->setColour(juce::TextEditor::focusedOutlineColourId, juce::Colour(240, 160, 35));
+    assistantPrompt->setTextToShowWhenEmpty(
+        "Describe a sound or ask for a change to the current patch...", juce::Colour(180, 180, 180));
+    Surge::Widgets::fixupJuceTextEditorAccessibility(*assistantPrompt);
+    assistantPrompt->onReturnKey = [this]() { applyMockAssistantPlan(); };
+    addAndMakeVisible(*assistantPrompt);
+
+    assistantStatus = std::make_unique<juce::Label>("Assistant status", "Offline mock provider");
+    assistantStatus->setJustificationType(juce::Justification::topLeft);
+    assistantStatus->setColour(juce::Label::textColourId, juce::Colours::white);
+    assistantStatus->setColour(juce::Label::backgroundColourId, juce::Colour(24, 24, 24));
+    assistantStatus->setOpaque(true);
+    assistantStatus->setFont(juce::Font(12.0f));
+    assistantStatus->setText(
+        "Describe a sound, or ask for a change to the current patch. Your next request builds on it.",
+        juce::dontSendNotification);
+    addAndMakeVisible(*assistantStatus);
+
     auto mcValue = Surge::Storage::getUserDefaultValue(&(this->processor.surge->storage),
                                                        Surge::Storage::MiddleC, 1);
 
@@ -273,13 +330,23 @@ SurgeSynthEditor::SurgeSynthEditor(SurgeSynthProcessor &p)
     }
 
     auto rg = BlockRezoom(this);
-    setSize(BASE_WINDOW_SIZE_X, BASE_WINDOW_SIZE_Y + yExtra);
+    setSize(BASE_WINDOW_SIZE_X,
+            BASE_WINDOW_SIZE_Y + yExtra + assistantBarHeight + assistantResponseHeight);
     // add the bottom right corner resizer only for VST2
     setResizable(true, processor.wrapperType == juce::AudioProcessor::wrapperType_VST);
 
     sge->audioLatencyNotified = processor.inputIsLatent;
     if (juce::Desktop::getInstance().isHeadless() == false)
         sge->open(nullptr);
+
+    // The frame does not exist during the first resized() call. Shift it after open so
+    // the assistant rows occupy real space instead of covering Surge's header.
+    sge->moveTopLeftTo(0, 0);
+
+    // Surge's main frame is created by open(); keep the assistant controls above it.
+    assistantPrompt->toFront(false);
+    assistantStatus->toFront(false);
+    assistantButton->toFront(false);
 
     idleTimer = std::make_unique<IdleTimer>(this);
     idleTimer->startTimer(1000 / 60);
@@ -288,6 +355,10 @@ SurgeSynthEditor::SurgeSynthEditor(SurgeSynthProcessor &p)
 SurgeSynthEditor::~SurgeSynthEditor()
 {
     idleTimer->stopTimer();
+
+    setAssistantPromptFocus(false);
+    assistantPrompt.reset();
+
     sge->close();
 
     if (sge->bitmapStore)
@@ -422,14 +493,25 @@ void SurgeSynthEditor::reapplySurgeComponentColours()
 
 void SurgeSynthEditor::resized()
 {
-    topLevelContainer->setBounds(getLocalBounds());
+    auto assistantOffset = assistantBarHeight + assistantResponseHeight;
+    topLevelContainer->setBounds(getLocalBounds().withTop(assistantOffset));
     drawExtendedControls = sge->getShowVirtualKeyboard();
 
     auto w = getWidth();
-    auto h =
-        getHeight() -
-        (drawExtendedControls ? 0.01 * sge->getZoomFactor() * extraYSpaceForVirtualKeyboard : 0);
+    auto h = getHeight() - assistantBarHeight - assistantResponseHeight -
+             (drawExtendedControls ? 0.01 * sge->getZoomFactor() * extraYSpaceForVirtualKeyboard : 0);
 
+    auto assistantBar = getLocalBounds().withHeight(assistantBarHeight).reduced(8, 6);
+    assistantButton->setBounds(assistantBar.removeFromRight(176));
+    assistantBar.removeFromRight(8);
+    assistantPrompt->setBounds(assistantBar);
+    assistantPrompt->setIndents(8, std::max(0, (assistantPrompt->getHeight() -
+                                                   assistantPrompt->getTextHeight()) /
+                                                  2));
+    assistantStatus->setBounds(getLocalBounds()
+                                   .withTop(assistantBarHeight)
+                                   .withHeight(assistantResponseHeight)
+                                   .reduced(8, 2));
     if (Surge::GUI::getIsStandalone())
     {
         juce::Component *comp = this;
@@ -442,9 +524,9 @@ void SurgeSynthEditor::resized()
                 {
                     auto b = getLocalBounds();
                     auto xw = 1.f * sge->getWindowSizeX() / b.getWidth();
-                    auto xh = 1.f *
-                              (sge->getWindowSizeY() +
-                               (drawExtendedControls ? extraYSpaceForVirtualKeyboard : 0)) /
+                    auto xh = 1.f * (sge->getWindowSizeY() +
+                                     (drawExtendedControls ? extraYSpaceForVirtualKeyboard : 0) +
+                                     assistantBarHeight + assistantResponseHeight) /
                               b.getHeight();
 
                     auto nz = std::min(1.0 / xw, 1.0 / xh);
@@ -485,8 +567,11 @@ void SurgeSynthEditor::resized()
     auto wR = 1.0 * w / sge->getWindowSizeX();
     auto hR = 1.0 * h / sge->getWindowSizeY();
 
-    auto ar = 1.f * sge->getWindowSizeX() /
-              (sge->getWindowSizeY() + (drawExtendedControls ? extraYSpaceForVirtualKeyboard : 0));
+    auto zoom = 0.01f * sge->getZoomFactor();
+    auto ar = zoom * sge->getWindowSizeX() /
+              (zoom * (sge->getWindowSizeY() +
+                       (drawExtendedControls ? extraYSpaceForVirtualKeyboard : 0)) +
+               assistantOffset);
     if (getConstrainer())
         getConstrainer()->setFixedAspectRatio(ar);
 
@@ -576,6 +661,50 @@ void SurgeSynthEditor::resized()
     {
         auto br = BlockRezoom(this);
         sge->setZoomFactor(round(sge->getZoomFactor() * zfn), false);
+    }
+}
+
+void SurgeSynthEditor::applyMockAssistantPlan()
+{
+    auto prompt = assistantPrompt->getText().trim();
+    if (prompt.isEmpty())
+    {
+        assistantStatus->setText("Enter a sound description first.", juce::dontSendNotification);
+        return;
+    }
+
+    // M1 uses a deterministic plan so the AU workflow can be tested without an API key.
+    sge->undoManager()->pushPatch();
+    auto &patch = processor.surge->storage.getPatch();
+    auto cutoff = processor.surge->idForParameter(&patch.scene[0].filterunit[0].cutoff);
+    auto resonance = processor.surge->idForParameter(&patch.scene[0].filterunit[0].resonance);
+    processor.surge->setParameter01(cutoff, 0.78f, true);
+    processor.surge->setParameter01(resonance, 0.18f, true);
+    processor.surge->storage.getPatch().isDirty = true;
+
+    assistantStatus->toFront(false);
+    assistantStatus->setText(
+        "Applied to current patch: cutoff 78%, resonance 18%. Undo is available in Surge.",
+        juce::dontSendNotification);
+}
+
+void SurgeSynthEditor::setAssistantPromptFocus(bool hasFocus)
+{
+    if (!sge || hasFocus == assistantPromptHasFocus)
+        return;
+
+    assistantPromptHasFocus = hasFocus;
+    if (hasFocus)
+    {
+        if (keyboard)
+            keyboard->focusLost(juce::Component::FocusChangeType::focusChangedDirectly);
+        ++sge->vkbForward;
+    }
+    else
+    {
+        jassert(sge->vkbForward > 0);
+        if (sge->vkbForward > 0)
+            --sge->vkbForward;
     }
 }
 

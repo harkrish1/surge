@@ -408,14 +408,18 @@ SurgeGUIEditor::SurgeGUIEditor(SurgeSynthEditor *jEd, SurgeSynthesizer *synth)
     Surge::GUI::setIsStandalone(juceEditor->processor.wrapperType ==
                                 juce::AudioProcessor::wrapperType_Standalone);
 
-    // Logic Pro and GarageBand do not support cursor hiding
-    Surge::GUI::setHostRequiresShowCursor(juce::PluginHostType().isLogic() ||
-                                          juce::PluginHostType().isGarageBand());
+    auto hostType = juce::PluginHostType();
+    auto isLogicFamilyHost = hostType.isLogic() || hostType.isGarageBand();
+
+    // Logic Pro and GarageBand do not support cursor hiding.
+    Surge::GUI::setHostRequiresShowCursor(isLogicFamilyHost);
 
     // Mirror the "never move keyboard focus" preference into the GUI layer so
-    // deep widget code can honor it without needing a storage reference.
+    // deep widget code can honor it without needing a storage reference. Logic
+    // family AU hosts can lose text input after a programmatic focus move, so
+    // default to direct click focus there while preserving the user override.
     Surge::GUI::setNeverMoveKeyboardFocus(Surge::Storage::getUserDefaultValue(
-        &(this->synth->storage), Surge::Storage::NeverMoveKeyboardFocus, false));
+        &(this->synth->storage), Surge::Storage::NeverMoveKeyboardFocus, isLogicFamilyHost));
 
     currentSkin = Surge::GUI::SkinDB::get()->defaultSkin(&(this->synth->storage));
 
@@ -3312,7 +3316,9 @@ void SurgeGUIEditor::setZoomFactor(float zf, bool resizeWindow)
         }
 
         juceEditor->setSize(zff * currentSkin->getWindowSizeX(),
-                            zff * (currentSkin->getWindowSizeY() + yExtra));
+                            zff * (currentSkin->getWindowSizeY() + yExtra) +
+                                SurgeSynthEditor::assistantBarHeight +
+                                SurgeSynthEditor::assistantResponseHeight);
     }
 
     if (frame)

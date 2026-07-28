@@ -8,6 +8,7 @@ option(SURGE_COPY_TO_PRODUCTS "Copy built plugins to the products directory" ON)
 option(SURGE_COPY_AFTER_BUILD "Copy JUCE plugins to system plugin area after build" OFF)
 option(SURGE_EXPOSE_PRESETS "Expose Surge XT presets via the JUCE program API" OFF)
 option(SURGE_INCLUDE_MELATONIN_INSPECTOR "Include Melatonin Inspector" OFF)
+option(SURGE_REQUEST_DEVICE_PERMISSIONS "Request microphone and Bluetooth permissions" ON)
 
 # Currently the JUCE LV2 build crashes in our CI pipeline, so leave it for users to self build
 option(SURGE_BUILD_LV2 "Build Surge XT as an LV2" OFF)
