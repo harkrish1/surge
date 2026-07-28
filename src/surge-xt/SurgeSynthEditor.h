@@ -114,7 +114,9 @@ class SurgeSynthEditor : public juce::AudioProcessorEditor,
     bool assistantPatchPending{false};
 
     void submitAssistantPrompt();
+    bool isCurrentPatchUntouchedInit() const;
     void applyCasioRetroKeyboardPatch();
+    void applyMoreReverb();
     void setAssistantPromptFocus(bool hasFocus);
 
     void setPitchModSustainGUI(int pitch, int mod, int sus);

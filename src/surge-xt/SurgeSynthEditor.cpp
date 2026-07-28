@@ -234,7 +234,7 @@ SurgeSynthEditor::SurgeSynthEditor(SurgeSynthProcessor &p)
     assistantStatus->setColour(juce::Label::backgroundColourId, juce::Colour(24, 24, 24));
     assistantStatus->setOpaque(true);
     assistantStatus->setFont(juce::Font(12.0f));
-    assistantStatus->setText("Local prototype: try \"casio retro keyboard sound\".",
+    assistantStatus->setText("Try \"casio retro keyboard sound\", then \"a bit more reverb\".",
                              juce::dontSendNotification);
     addAndMakeVisible(*assistantStatus);
 
@@ -698,13 +698,27 @@ void SurgeSynthEditor::submitAssistantPrompt()
     }
 
     auto request = prompt.toLowerCase();
+    if (!isCurrentPatchUntouchedInit())
+    {
+        if (request.contains("reverb"))
+        {
+            applyMoreReverb();
+        }
+        else
+        {
+            assistantStatus->setText(
+                "Follow-up prototype: try \"a bit more reverb\". The current patch is preserved.",
+                juce::dontSendNotification);
+        }
+        return;
+    }
+
     auto isCasioRequest =
         request.contains("casio") || (request.contains("retro") && request.contains("keyboard"));
     if (!isCasioRequest)
     {
-        assistantStatus->setText(
-            "This local prototype currently supports: casio retro keyboard sound.",
-            juce::dontSendNotification);
+        assistantStatus->setText("Fresh-patch prototype: try \"casio retro keyboard sound\".",
+                                 juce::dontSendNotification);
         return;
     }
 
@@ -743,6 +757,32 @@ void SurgeSynthEditor::submitAssistantPrompt()
                              juce::dontSendNotification);
     synth->enqueuePatchForLoad(presetData + headerSize, chunkSize);
     synth->processAudioThreadOpsWhenAudioEngineUnavailable();
+}
+
+bool SurgeSynthEditor::isCurrentPatchUntouchedInit() const
+{
+    const auto *synth = processor.surge.get();
+    const auto &storage = synth->storage;
+    const auto &patch = storage.getPatch();
+
+    if (patch.isDirty)
+        return false;
+
+    if (synth->patchid < 0)
+        return patch.name == "Init" && patch.category == "Init";
+
+    if (patch.name != storage.initPatchName || patch.category != storage.initPatchCategory)
+        return false;
+
+    if (synth->patchid >= storage.patch_list.size())
+        return false;
+
+    const auto &listedPatch = storage.patch_list[synth->patchid];
+    const auto &listedCategory = storage.patch_category[listedPatch.category];
+    const auto expectsFactoryPatch = storage.initPatchCategoryType == "Factory";
+    return listedPatch.name == storage.initPatchName &&
+           listedCategory.name == storage.initPatchCategory &&
+           listedCategory.isFactory == expectsFactoryPatch;
 }
 
 void SurgeSynthEditor::applyCasioRetroKeyboardPatch()
@@ -858,6 +898,67 @@ void SurgeSynthEditor::applyCasioRetroKeyboardPatch()
     assistantStatus->setText(
         "Created Casio Retro Keyboard: pulse layers, plucky envelopes, and a low-pass filter.",
         juce::dontSendNotification);
+}
+
+void SurgeSynthEditor::applyMoreReverb()
+{
+    auto *synth = processor.surge.get();
+    auto &patch = synth->storage.getPatch();
+
+    auto finishChange = [this, synth, &patch](const juce::String &status) {
+        patch.isDirty = true;
+        synth->patchChanged = true;
+        sge->queueRebuildUI();
+        assistantStatus->toFront(false);
+        assistantStatus->setText(status, juce::dontSendNotification);
+    };
+
+    for (auto &effect : patch.fx)
+    {
+        auto type = effect.type.val.i;
+        if (type != fxt_reverb && type != fxt_reverb2 && type != fxt_spring_reverb)
+            continue;
+
+        for (auto &parameter : effect.p)
+        {
+            if (std::strcmp(parameter.get_name(), "Mix") != 0)
+                continue;
+
+            auto currentMix = parameter.get_value_f01();
+            auto increasedMix = std::min(1.0f, currentMix + 0.1f);
+            if (increasedMix == currentMix)
+            {
+                assistantStatus->setText("Reverb mix is already at maximum; no settings changed.",
+                                         juce::dontSendNotification);
+                return;
+            }
+
+            sge->undoManager()->pushPatch();
+            synth->setParameter01(synth->idForParameter(&parameter), increasedMix, true);
+            finishChange(
+                "Increased the current reverb mix slightly; all other settings are unchanged.");
+            return;
+        }
+    }
+
+    constexpr int globalFxSlots[]{fxslot_global1, fxslot_global2, fxslot_global3, fxslot_global4};
+    for (auto slot : globalFxSlots)
+    {
+        auto &effect = patch.fx[slot];
+        if (effect.type.val.i != fxt_off)
+            continue;
+
+        sge->undoManager()->pushPatch();
+        synth->setParameter01(synth->idForParameter(&effect.type),
+                              effect.type.value_to_normalized(fxt_reverb2), true);
+        synth->processAudioThreadOpsWhenAudioEngineUnavailable();
+        finishChange(juce::String("Added Reverb 2 in ") + fxslot_shortnames[slot] +
+                     "; all other settings are unchanged.");
+        return;
+    }
+
+    assistantStatus->setText("No empty global FX slot is available; no settings changed.",
+                             juce::dontSendNotification);
 }
 
 void SurgeSynthEditor::setAssistantPromptFocus(bool hasFocus)
