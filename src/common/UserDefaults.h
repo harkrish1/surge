@@ -184,6 +184,10 @@ enum DefaultKey
     OSCPortOut,
     OSCIPOut,
 
+    // Assistant connection metadata. Provider credentials are stored in the OS credential store.
+    AssistantProvider,
+    AssistantModel,
+
     nKeys
 };
 

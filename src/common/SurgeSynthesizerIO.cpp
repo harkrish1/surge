@@ -416,8 +416,9 @@ bool SurgeSynthesizer::loadPatchByPath(const char *fxpPath, int categoryId, cons
     return true;
 }
 
-void SurgeSynthesizer::enqueuePatchForLoad(const void *data, int size)
+std::uint64_t SurgeSynthesizer::enqueuePatchForLoad(const void *data, int size)
 {
+    std::uint64_t sequence{0};
     {
         // If we are forcing values on, we don't want to do any enqueued loads
         // or want to wait for them to complete
@@ -428,12 +429,15 @@ void SurgeSynthesizer::enqueuePatchForLoad(const void *data, int size)
     {
         std::lock_guard<std::mutex> g(rawLoadQueueMutex);
 
+        sequence = rawLoadSequence.fetch_add(1) + 1;
         enqueuedLoadData.reset(new char[size]);
         memcpy(enqueuedLoadData.get(), data, size);
         enqueuedLoadSize = size;
+        enqueuedLoadSequence = sequence;
         rawLoadEnqueued = true;
         rawLoadNeedsUIDawExtraState = false;
     }
+    return sequence;
 }
 
 void SurgeSynthesizer::processEnqueuedPatchIfNeeded()
@@ -452,6 +456,7 @@ void SurgeSynthesizer::processEnqueuedPatchIfNeeded()
         rawLoadEnqueued = false;
         loadRaw(enqueuedLoadData.get(), enqueuedLoadSize);
         loadFromDawExtraState();
+        completedRawLoadSequence = enqueuedLoadSequence;
 
         rawLoadNeedsUIDawExtraState = true;
         refresh_editor = true;

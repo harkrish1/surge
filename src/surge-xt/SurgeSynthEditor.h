@@ -24,15 +24,21 @@
 #define SURGE_SRC_SURGE_XT_SURGESYNTHEDITOR_H
 
 #include "SurgeSynthProcessor.h"
+#include "AssistantClient.h"
 #include "SkinSupport.h"
 
 #include "juce_audio_utils/juce_audio_utils.h"
 
+#include <cstddef>
 #include <forward_list>
+#include <future>
+#include <map>
+#include <vector>
 #include "version.h"
 
 class SurgeGUIEditor;
 class SurgeJUCELookAndFeel;
+class AssistantConnectionOverlay;
 
 //==============================================================================
 
@@ -107,17 +113,70 @@ class SurgeSynthEditor : public juce::AudioProcessorEditor,
     std::unique_ptr<juce::Label> tempoLabel, sustainLabel;
     std::unique_ptr<juce::TextEditor> tempoTypein;
     std::unique_ptr<juce::TextButton> assistantButton;
+    std::unique_ptr<juce::TextButton> assistantClearPatchButton;
+    std::unique_ptr<juce::TextButton> assistantConnectionButton;
     std::unique_ptr<juce::TextEditor> assistantPrompt;
     std::unique_ptr<juce::Label> assistantStatus;
+    std::unique_ptr<AssistantConnectionOverlay> assistantConnectionOverlay;
     std::unique_ptr<juce::Component> topLevelContainer;
     bool assistantPromptHasFocus{false};
     bool assistantPatchPending{false};
+    bool assistantClearPatchPending{false};
+    bool assistantClearPatchConfirmationPending{false};
+    bool assistantGenerationPending{false};
+    std::uint64_t assistantPatchLoadSequence{0};
+    static constexpr std::size_t assistantConversationLimit{10};
 
     void submitAssistantPrompt();
+    void requestClearPatch();
+    void beginClearPatch();
+    bool enqueueDefaultPatch();
+    void setAssistantWorking(bool working);
     bool isCurrentPatchUntouchedInit() const;
     void applyCasioRetroKeyboardPatch();
     void applyMoreReverb();
     void setAssistantPromptFocus(bool hasFocus);
+
+    enum class AssistantPendingAction
+    {
+        None,
+        Connect,
+        Disconnect,
+        Generate,
+    };
+
+    struct AssistantPatchSnapshot
+    {
+        std::vector<float> parameterValues;
+        std::string name;
+        std::string category;
+        int patchId{-1};
+        bool dirty{false};
+    };
+
+    std::unique_ptr<Surge::Assistant::Client> assistantClient;
+    std::future<Surge::Assistant::Result> assistantFuture;
+    AssistantPendingAction assistantPendingAction{AssistantPendingAction::None};
+    Surge::Assistant::Provider assistantProvider{Surge::Assistant::Provider::None};
+    Surge::Assistant::Provider assistantPendingProvider{Surge::Assistant::Provider::None};
+    juce::String assistantModel;
+    std::map<Surge::Assistant::Provider, std::vector<juce::String>> assistantModels;
+    AssistantPatchSnapshot assistantPatchSnapshot;
+    juce::String assistantRequestPrompt;
+    juce::String assistantPromptBeforeClear;
+    bool assistantRequestWasFresh{false};
+
+    void showAssistantConnectionMenu();
+    void showAssistantConnectionEditor(Surge::Assistant::Provider provider);
+    void beginAssistantConnection(Surge::Assistant::Provider provider, const juce::String &apiKey);
+    void disconnectAssistantConnection();
+    void pollAssistantResult();
+    void handleAssistantResult(Surge::Assistant::Result result);
+    void updateAssistantConnectionButton();
+    Surge::Assistant::PatchRequest buildAssistantPatchRequest(const juce::String &prompt,
+                                                              bool freshPatch);
+    bool currentPatchMatchesAssistantSnapshot() const;
+    void applyAssistantPatchPlan(const Surge::Assistant::PatchPlan &plan);
 
     void setPitchModSustainGUI(int pitch, int mod, int sus);
 

@@ -458,6 +458,7 @@ class SurgeSynthProcessor : public juce::AudioProcessor,
     std::unique_ptr<SurgeSynthesizer> surge;
     std::unordered_map<SurgeSynthesizer::ID, SurgeParamToJuceParamAdapter *> paramsByID;
     std::vector<SurgeMacroToJuceParamAdapter *> macrosById;
+    std::vector<juce::String> assistantPromptHistory;
 
     SurgeBypassParameter *bypassParameter{nullptr};
     juce::AudioProcessorParameter *getBypassParameter() const override;

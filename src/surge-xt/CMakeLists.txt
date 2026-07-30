@@ -81,6 +81,8 @@ if (SURGE_EXPOSE_PRESETS)
 endif()
 
 target_sources(${PROJECT_NAME} PRIVATE
+  AssistantClient.cpp
+  AssistantClient.h
   SurgeSynthEditor.cpp
   SurgeSynthEditor.h
   SurgeSynthProcessor.cpp

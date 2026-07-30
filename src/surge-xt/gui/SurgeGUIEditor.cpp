@@ -2950,7 +2950,8 @@ void SurgeGUIEditor::toggleMPE()
 juce::PopupMenu::Options SurgeGUIEditor::popupMenuOptions(const juce::Point<int> &where)
 {
     auto o = juce::PopupMenu::Options();
-    o = o.withTargetComponent(juceEditor);
+    // Plugin hosts may retain temporary native menu windows after the editor closes.
+    o = o.withTargetComponent(juceEditor).withParentComponent(juceEditor);
     if (where.x > 0 && where.y > 0)
     {
         auto r = juce::Rectangle<int>().withWidth(1).withHeight(1).withPosition(

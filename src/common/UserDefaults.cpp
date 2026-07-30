@@ -398,6 +398,14 @@ std::string defaultKeyToString(DefaultKey k)
         r = "startOSCOut";
         break;
 
+    case AssistantProvider:
+        r = "assistantProvider";
+        break;
+
+    case AssistantModel:
+        r = "assistantModel";
+        break;
+
     case nKeys:
         break;
     }

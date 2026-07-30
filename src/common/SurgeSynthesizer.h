@@ -34,6 +34,7 @@ struct QuadFilterChainState;
 #include <list>
 #include <utility>
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <bitset>
 #include <vector>
@@ -422,8 +423,10 @@ class alignas(16) SurgeSynthesizer
     std::mutex rawLoadQueueMutex;
     std::unique_ptr<char[]> enqueuedLoadData{nullptr}; // if this is set I need to free it
     int enqueuedLoadSize{0};
-    void enqueuePatchForLoad(const void *data, int size); // safe from any thread
-    void processEnqueuedPatchIfNeeded();                  // only safe from audio thread
+    std::atomic<std::uint64_t> rawLoadSequence{0}, completedRawLoadSequence{0};
+    std::uint64_t enqueuedLoadSequence{0};
+    std::uint64_t enqueuePatchForLoad(const void *data, int size); // safe from any thread
+    void processEnqueuedPatchIfNeeded();                           // only safe from audio thread
 
     void loadRaw(const void *data, int size, bool preset = false);
     void loadPatch(int id);
