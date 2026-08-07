@@ -28,8 +28,13 @@ enum class Provider
     ChatGPT,
     DeepSeek,
     MiniMax,
+    OpenAI,
+    Anthropic,
+    Gemini,
+    OpenRouter,
 };
 
+std::vector<Provider> availableProviders();
 juce::String providerId(Provider provider);
 juce::String providerDisplayName(Provider provider);
 juce::String providerDefaultModel(Provider provider);
@@ -97,6 +102,10 @@ Result parsePatchPlanJson(const juce::String &json, bool freshPatch,
                           const std::set<int> &allowedParameterIds);
 Result parseChatCompletion(const juce::String &response, bool freshPatch,
                            const std::set<int> &allowedParameterIds);
+Result parseOpenAIResponse(const juce::String &response, bool freshPatch,
+                           const std::set<int> &allowedParameterIds);
+Result parseAnthropicMessage(const juce::String &response, bool freshPatch,
+                             const std::set<int> &allowedParameterIds);
 
 class Client
 {
@@ -107,7 +116,7 @@ class Client
     std::future<Result> connect(Provider provider, const juce::String &apiKey);
     std::future<Result> disconnect(Provider provider);
     std::future<Result> generate(PatchRequest request);
-    void cancel();
+    bool cancel();
 
   private:
     class Impl;

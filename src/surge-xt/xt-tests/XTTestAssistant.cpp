@@ -10,6 +10,7 @@
 #include "AssistantClient.h"
 #include "SurgeSynthEditor.h"
 #include "gui/UndoManager.h"
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <set>
@@ -18,6 +19,20 @@
 TEST_CASE("Assistant validates model patch plans", "[xt-assistant]")
 {
     const std::set<int> allowedIds{4, 8};
+
+    auto providers = Surge::Assistant::availableProviders();
+    REQUIRE(providers.size() == 7);
+    for (auto provider : providers)
+    {
+        CHECK(Surge::Assistant::providerFromId(Surge::Assistant::providerId(provider)) == provider);
+        CHECK(Surge::Assistant::providerDisplayName(provider).isNotEmpty());
+        CHECK(Surge::Assistant::providerDefaultModel(provider).isNotEmpty());
+        CHECK(Surge::Assistant::providerKeyPage(provider).startsWith("https://"));
+    }
+    CHECK(Surge::Assistant::providerFromId("openai") == Surge::Assistant::Provider::OpenAI);
+    CHECK(Surge::Assistant::providerFromId("anthropic") == Surge::Assistant::Provider::Anthropic);
+    CHECK(Surge::Assistant::providerFromId("gemini") == Surge::Assistant::Provider::Gemini);
+    CHECK(Surge::Assistant::providerFromId("openrouter") == Surge::Assistant::Provider::OpenRouter);
 
     auto valid = Surge::Assistant::parsePatchPlanJson(
         R"json(```json
@@ -54,6 +69,45 @@ TEST_CASE("Assistant validates model patch plans", "[xt-assistant]")
         false, allowedIds);
     REQUIRE(followUp.ok);
     CHECK(followUp.plan.name.isEmpty());
+
+    auto truncatedChat = Surge::Assistant::parseChatCompletion(
+        R"json({"choices":[{"finish_reason":"length","message":{"content":"{\"name\":\"Incomplete\",\"summary\":\"Partial\",\"operations\":[{\"parameter_id\":4,\"value\":0.3}]}"}}]})json",
+        true, allowedIds);
+    CHECK_FALSE(truncatedChat.ok);
+    CHECK(truncatedChat.error.containsIgnoreCase("token limit"));
+
+    auto openAI = Surge::Assistant::parseOpenAIResponse(
+        R"json({"status":"completed","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":"{\"name\":\"OpenAI Keys\",\"summary\":\"Opened the filter.\",\"operations\":[{\"parameter_id\":4,\"value\":0.6}]}"}]}]})json",
+        true, allowedIds);
+    REQUIRE(openAI.ok);
+    CHECK(openAI.plan.name == "OpenAI Keys");
+    REQUIRE(openAI.plan.operations.size() == 1);
+    CHECK(openAI.plan.operations.front().value == Catch::Approx(0.6f));
+
+    auto incompleteOpenAI = Surge::Assistant::parseOpenAIResponse(
+        R"json({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]})json",
+        true, allowedIds);
+    CHECK_FALSE(incompleteOpenAI.ok);
+    CHECK(incompleteOpenAI.error.containsIgnoreCase("token limit"));
+
+    auto anthropic = Surge::Assistant::parseAnthropicMessage(
+        R"json({"content":[{"type":"text","text":"{\"name\":\"Claude Keys\",\"summary\":\"Reduced the reverb.\",\"operations\":[{\"parameter_id\":8,\"value\":0.2}]}"}],"stop_reason":"end_turn"})json",
+        true, allowedIds);
+    REQUIRE(anthropic.ok);
+    CHECK(anthropic.plan.name == "Claude Keys");
+    CHECK(anthropic.plan.summary == "Reduced the reverb.");
+    REQUIRE(anthropic.plan.operations.size() == 1);
+    CHECK(anthropic.plan.operations.front().parameterId == 8);
+    CHECK(anthropic.plan.operations.front().value == Catch::Approx(0.2f));
+
+    auto truncatedAnthropic = Surge::Assistant::parseAnthropicMessage(
+        R"json({"content":[{"type":"text","text":"{\"name\":\"Incomplete\",\"summary\":\"Partial\",\"operations\":[{\"parameter_id\":8,\"value\":0.2}]}"}],"stop_reason":"max_tokens"})json",
+        true, allowedIds);
+    CHECK_FALSE(truncatedAnthropic.ok);
+    CHECK(truncatedAnthropic.error.containsIgnoreCase("token limit"));
+
+    Surge::Assistant::Client client;
+    CHECK_FALSE(client.cancel());
 }
 
 TEST_CASE("Assistant creates, clears, and restores a patch", "[xt-assistant]")
@@ -128,7 +182,10 @@ TEST_CASE("Assistant creates, clears, and restores a patch", "[xt-assistant]")
     CHECK(processor->assistantPromptHistory[1] == "add reverb");
     CHECK(editor->assistantPendingAction == SurgeSynthEditor::AssistantPendingAction::None);
     CHECK_FALSE(editor->assistantGenerationPending);
-    CHECK_FALSE(editor->assistantPrompt->isEnabled());
+    CHECK(editor->assistantPrompt->isEnabled());
+    CHECK_FALSE(editor->assistantPrompt->isReadOnly());
+    editor->assistantPrompt->moveCaretToEnd();
+    editor->assistantPrompt->insertTextAtCaret(" edited");
     CHECK(editor->assistantButton->getButtonText() == "Ask\nAssistant");
     CHECK_FALSE(editor->assistantClearPatchButton->isEnabled());
 
@@ -142,7 +199,7 @@ TEST_CASE("Assistant creates, clears, and restores a patch", "[xt-assistant]")
     CHECK_FALSE(editor->assistantGenerationPending);
     CHECK(editor->assistantPendingAction == SurgeSynthEditor::AssistantPendingAction::None);
     CHECK(editor->assistantPrompt->isEnabled());
-    CHECK(editor->assistantPrompt->getText() == "warm pad for later");
+    CHECK(editor->assistantPrompt->getText() == "warm pad for later edited");
     CHECK(editor->assistantStatus->getText().containsIgnoreCase("reset to default"));
     CHECK(editor->assistantButton->getButtonText() == "Ask\nAssistant");
     CHECK(editor->assistantClearPatchButton->isEnabled());
@@ -202,6 +259,52 @@ TEST_CASE("Assistant builds its parameter catalog promptly", "[xt-assistant]")
     CHECK(request.previousPrompts.front() == "Earlier request 3");
     CHECK(request.previousPrompts.back() == "Earlier request 11");
     CHECK(elapsed < std::chrono::seconds(2));
+
+    auto historyBeforeFailure = processor->assistantPromptHistory;
+    editor->assistantProvider = Surge::Assistant::Provider::OpenAI;
+    editor->assistantModel.clear();
+    editor->assistantPrompt->setText("do not retain this failed request", false);
+    editor->submitAssistantPrompt();
+    REQUIRE(editor->assistantPendingAction == SurgeSynthEditor::AssistantPendingAction::Generate);
+    REQUIRE(editor->assistantFuture.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    editor->idle();
+    CHECK(editor->assistantPendingAction == SurgeSynthEditor::AssistantPendingAction::None);
+    CHECK_FALSE(editor->assistantGenerationPending);
+    CHECK(processor->assistantPromptHistory == historyBeforeFailure);
+
+    std::promise<Surge::Assistant::Result> completedPromise;
+    editor->assistantFuture = completedPromise.get_future();
+    editor->assistantPendingAction = SurgeSynthEditor::AssistantPendingAction::Generate;
+    editor->assistantGenerationPending = true;
+    Surge::Assistant::Result completedFailure;
+    completedFailure.kind = Surge::Assistant::ResultKind::Generation;
+    completedFailure.error = "Completed before cancellation.";
+    completedPromise.set_value(std::move(completedFailure));
+    editor->cancelAssistantRequest();
+    CHECK(editor->assistantPendingAction == SurgeSynthEditor::AssistantPendingAction::None);
+    CHECK_FALSE(editor->assistantGenerationPending);
+    CHECK(editor->assistantStatus->getText() == "Completed before cancellation.");
+    CHECK(processor->assistantPromptHistory == historyBeforeFailure);
+
+    auto &patch = processor->surge->storage.getPatch();
+    REQUIRE_FALSE(patch.param_ptr.empty());
+    auto booleanParameter =
+        std::find_if(patch.param_ptr.begin(), patch.param_ptr.end(),
+                     [](const auto *parameter) { return parameter->valtype == vt_bool; });
+    REQUIRE(booleanParameter != patch.param_ptr.end());
+    auto booleanParameterId =
+        static_cast<int>(std::distance(patch.param_ptr.begin(), booleanParameter));
+    auto equivalentBooleanValue = (*booleanParameter)->get_value_f01() < 0.5f ? 0.1f : 0.9f;
+    Surge::Assistant::Result noOpResult;
+    noOpResult.kind = Surge::Assistant::ResultKind::Generation;
+    noOpResult.ok = true;
+    noOpResult.plan.operations.push_back({booleanParameterId, equivalentBooleanValue});
+    editor->assistantPendingAction = SurgeSynthEditor::AssistantPendingAction::Generate;
+    editor->assistantGenerationPending = true;
+    editor->assistantRequestPrompt = "retain only if applied";
+    editor->handleAssistantResult(std::move(noOpResult));
+    CHECK(editor->assistantStatus->getText().containsIgnoreCase("did not change"));
+    CHECK(processor->assistantPromptHistory == historyBeforeFailure);
 
     juce::LookAndFeel::setDefaultLookAndFeel(nullptr);
     editor.reset();

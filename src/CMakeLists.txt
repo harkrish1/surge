@@ -71,6 +71,13 @@ endif()
 
 message(STATUS "ALSA/JACK : ALSA=${SURGE_USE_ALSA}  JACK=${SURGE_USE_JACK}")
 
+if(NOT SURGE_SKIP_JUCE_FOR_RACK AND
+   (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME MATCHES ".*BSD"))
+  set(SURGE_USE_CURL TRUE)
+else()
+  set(SURGE_USE_CURL FALSE)
+endif()
+
 
 set(SURGE_SIMDE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../libs/simde" CACHE STRING "Path to simde library source tree")
 add_library(simde INTERFACE)
@@ -78,12 +85,15 @@ target_include_directories(simde INTERFACE ${SURGE_SIMDE_PATH})
 add_library(surge::simde ALIAS simde)
 
 add_library(surge-juce INTERFACE)
+if(SURGE_USE_CURL)
+  target_link_libraries(surge-juce INTERFACE juce::pkgconfig_JUCE_CURL_LINUX_DEPS)
+endif()
 target_compile_definitions(surge-juce INTERFACE
   JUCE_ALLOW_STATIC_NULL_VARIABLES=0
   JUCE_STRICT_REFCOUNTEDPOINTER=1
 
   JUCE_VST3_CAN_REPLACE_VST2=0
-  JUCE_USE_CURL=0
+  JUCE_USE_CURL=$<IF:$<BOOL:${SURGE_USE_CURL}>,1,0>
   JUCE_WEB_BROWSER=0
   JUCE_USE_CAMERA=disabled
 

@@ -25,6 +25,7 @@
 #include "SurgeImageStore.h"
 #include "SurgeImage.h"
 #include "SurgeGUIEditor.h"
+#include "SurgeGUIUtils.h"
 #include "SurgeJUCELookAndFeel.h"
 #include "RuntimeFont.h"
 #include "AccessibleHelpers.h"
@@ -36,6 +37,7 @@
 #include <cstring>
 #include "gui/widgets/CurrentFxDisplay.h"
 #include "gui/widgets/MainFrame.h"
+#include "gui/overlays/Alert.h"
 #include <chrono>
 #include <cstdint>
 #include <set>
@@ -119,13 +121,21 @@ class AssistantConnectionOverlay : public juce::Component
         title.setColour(juce::Label::textColourId, juce::Colours::white);
         addAndMakeVisible(title);
 
+        juce::String keyStorageInstructions;
+#if JUCE_MAC || JUCE_WINDOWS
+        keyStorageInstructions =
+            "Enter the API or subscription key from your provider account. It will be stored in "
+            "the operating system credential store, never in a patch or DAW project.";
+#else
+        keyStorageInstructions =
+            "Enter the API or subscription key from your provider account. It is kept in memory "
+            "for this Surge XT session only, never in a patch or DAW project.";
+#endif
         instructions.setText(
             provider == Surge::Assistant::Provider::ChatGPT
                 ? "Use the official Codex runtime to sign in with ChatGPT in your browser. Surge "
                   "XT never receives or stores your ChatGPT tokens."
-                : "Enter the API or subscription key from your provider account. It will be "
-                  "stored in the operating system credential store, never in a patch or DAW "
-                  "project.",
+                : keyStorageInstructions,
             juce::dontSendNotification);
         instructions.setFont(juce::Font(13.0f));
         instructions.setColour(juce::Label::textColourId, juce::Colour(205, 205, 205));
@@ -241,10 +251,10 @@ class AssistantConnectionOverlay : public juce::Component
 
     void setBusy(bool busy)
     {
-        apiKey.setEnabled(!busy);
         connectButton.setEnabled(!busy && (provider == Surge::Assistant::Provider::ChatGPT ||
                                            apiKey.getText().trim().isNotEmpty()));
-        cancelButton.setEnabled(!busy);
+        cancelButton.setButtonText(busy ? "Cancel request" : "Cancel");
+        cancelButton.setEnabled(true);
         keyPageButton.setEnabled(!busy);
         if (busy)
             status.setText("Testing connection...", juce::dontSendNotification);
@@ -255,14 +265,23 @@ class AssistantConnectionOverlay : public juce::Component
         status.setText(message, juce::dontSendNotification);
     }
 
+    void setCancelling()
+    {
+        connectButton.setEnabled(false);
+        cancelButton.setButtonText("Cancelling...");
+        cancelButton.setEnabled(false);
+        keyPageButton.setEnabled(false);
+        status.setText("Cancelling connection...", juce::dontSendNotification);
+    }
+
     AssistantPromptEditor &keyEditor() { return apiKey; }
     Surge::Assistant::Provider getProvider() const { return provider; }
     void focusInitialControl()
     {
         if (provider == Surge::Assistant::Provider::ChatGPT)
-            connectButton.grabKeyboardFocus();
+            Surge::GUI::grabKeyboardFocusIfAllowed(&connectButton);
         else
-            apiKey.grabKeyboardFocus();
+            Surge::GUI::grabKeyboardFocusIfAllowed(&apiKey);
     }
 
     std::function<void(const juce::String &)> onConnect;
@@ -431,11 +450,12 @@ SurgeSynthEditor::SurgeSynthEditor(SurgeSynthProcessor &p)
     sge = std::make_unique<SurgeGUIEditor>(this, processor.surge.get());
     assistantClient = std::make_unique<Surge::Assistant::Client>();
 
-    assistantModels[Surge::Assistant::Provider::ChatGPT] = {"default"};
-    assistantModels[Surge::Assistant::Provider::DeepSeek] = {"deepseek-v4-flash", "deepseek-v4-pro",
-                                                             "deepseek-chat", "deepseek-reasoner"};
-    assistantModels[Surge::Assistant::Provider::MiniMax] = {
-        "MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5"};
+    for (auto provider : Surge::Assistant::availableProviders())
+    {
+        auto defaultModel = Surge::Assistant::providerDefaultModel(provider);
+        if (defaultModel.isNotEmpty())
+            assistantModels[provider] = {defaultModel};
+    }
 
     assistantProvider = Surge::Assistant::providerFromId(Surge::Storage::getUserDefaultValue(
         &processor.surge->storage, Surge::Storage::AssistantProvider, "none"));
@@ -454,7 +474,12 @@ SurgeSynthEditor::SurgeSynthEditor(SurgeSynthProcessor &p)
     assistantButton->setMouseClickGrabsKeyboardFocus(false);
     assistantButton->setTitle("Ask Assistant");
     assistantButton->setDescription("Ask the assistant to update the current sound.");
-    assistantButton->onClick = [this]() { submitAssistantPrompt(); };
+    assistantButton->onClick = [this]() {
+        if (assistantPendingAction == AssistantPendingAction::Generate)
+            cancelAssistantRequest();
+        else
+            submitAssistantPrompt();
+    };
 
     assistantClearPatchButton = std::make_unique<AssistantActionButton>("Clear\nPatch");
     assistantClearPatchButton->setColour(juce::TextButton::buttonColourId,
@@ -644,12 +669,19 @@ SurgeSynthEditor::~SurgeSynthEditor()
     idleTimer->stopTimer();
     juce::PopupMenu::dismissAllActiveMenus();
 
-    assistantConnectionOverlay.reset();
     if (assistantClient)
     {
+        if (assistantPendingAction != AssistantPendingAction::None && assistantFuture.valid())
+        {
+            assistantCancellationRequested =
+                assistantCancellationRequested || assistantClient->cancel();
+            assistantFuture.wait();
+            pollAssistantResult();
+        }
         assistantClient->cancel();
         assistantClient.reset();
     }
+    assistantConnectionOverlay.reset();
 
     setAssistantPromptFocus(false);
     assistantPrompt.reset();
@@ -731,14 +763,20 @@ void SurgeSynthEditor::idle()
 {
     pollAssistantResult();
 
+    if (assistantClearPatchConfirmationPending && (!sge->alert || !sge->alert->isVisible()))
+    {
+        assistantClearPatchConfirmationPending = false;
+        setAssistantWorking(false);
+    }
+
     if (assistantClearPatchPending || assistantPatchPending)
     {
+        processor.surge->processAudioThreadOpsWhenAudioEngineUnavailable();
         auto completedSequence = processor.surge->completedRawLoadSequence.load();
         if (completedSequence > assistantPatchLoadSequence)
         {
             assistantClearPatchPending = false;
             assistantPatchPending = false;
-            assistantPromptBeforeClear.clear();
             assistantPatchLoadSequence = 0;
             setAssistantWorking(false);
             assistantStatus->setText(
@@ -758,9 +796,6 @@ void SurgeSynthEditor::idle()
             else
             {
                 assistantClearPatchPending = false;
-                auto prompt = assistantPromptBeforeClear;
-                assistantPromptBeforeClear.clear();
-                assistantPrompt->setText(prompt, juce::dontSendNotification);
                 setAssistantWorking(false);
                 assistantStatus->setText(
                     "Patch cleared and reset to default. Type or edit a description, then choose "
@@ -856,7 +891,7 @@ void SurgeSynthEditor::resized()
     if (assistantConnectionOverlay)
     {
         assistantConnectionOverlay->setBounds(getLocalBounds());
-        assistantConnectionOverlay->toFront(true);
+        assistantConnectionOverlay->toFront(false);
     }
     if (Surge::GUI::getIsStandalone())
     {
@@ -1041,9 +1076,7 @@ void SurgeSynthEditor::submitAssistantPrompt()
             return;
         }
 
-        processor.assistantPromptHistory.push_back(prompt);
-        while (processor.assistantPromptHistory.size() > assistantConversationLimit)
-            processor.assistantPromptHistory.erase(processor.assistantPromptHistory.begin());
+        assistantCancellationRequested = false;
         assistantFuture = assistantClient->generate(std::move(request));
         assistantPendingAction = AssistantPendingAction::Generate;
         assistantGenerationPending = true;
@@ -1103,7 +1136,6 @@ void SurgeSynthEditor::requestClearPatch()
     }
 
     assistantClearPatchConfirmationPending = true;
-    assistantPrompt->setEnabled(false);
     assistantButton->setEnabled(false);
     assistantClearPatchButton->setEnabled(false);
     assistantConnectionButton->setEnabled(false);
@@ -1133,16 +1165,13 @@ void SurgeSynthEditor::beginClearPatch()
         assistantPendingAction != AssistantPendingAction::None)
         return;
 
-    assistantPromptBeforeClear = assistantPrompt->getText();
     if (!enqueueDefaultPatch())
     {
-        assistantPromptBeforeClear.clear();
         setAssistantWorking(false);
         return;
     }
 
     assistantClearPatchPending = true;
-    assistantPrompt->setEnabled(false);
     assistantButton->setEnabled(false);
     assistantClearPatchButton->setEnabled(false);
     assistantConnectionButton->setEnabled(false);
@@ -1188,12 +1217,33 @@ bool SurgeSynthEditor::enqueueDefaultPatch()
 
 void SurgeSynthEditor::setAssistantWorking(bool working)
 {
-    assistantPrompt->setEnabled(!working);
-    assistantButton->setButtonText(working ? "Working..." : "Ask\nAssistant");
-    assistantButton->setTitle(working ? "Assistant is working" : "Ask Assistant");
-    assistantButton->setEnabled(!working);
+    auto cancelling = working && assistantCancellationRequested;
+    auto canCancel =
+        working && assistantPendingAction == AssistantPendingAction::Generate && !cancelling;
+    assistantButton->setButtonText(cancelling  ? "Cancelling..."
+                                   : canCancel ? "Cancel\nRequest"
+                                               : (working ? "Working..." : "Ask\nAssistant"));
+    assistantButton->setTitle(cancelling  ? "Cancelling assistant request"
+                              : canCancel ? "Cancel assistant request"
+                                          : (working ? "Assistant is working" : "Ask Assistant"));
+    assistantButton->setEnabled(!working || canCancel);
     assistantClearPatchButton->setEnabled(!working);
     assistantConnectionButton->setEnabled(!working);
+}
+
+void SurgeSynthEditor::cancelAssistantRequest()
+{
+    if (assistantPendingAction != AssistantPendingAction::Generate)
+        return;
+
+    if (!assistantClient->cancel())
+    {
+        pollAssistantResult();
+        return;
+    }
+    assistantCancellationRequested = true;
+    setAssistantWorking(true);
+    assistantStatus->setText("Cancelling assistant request...", juce::dontSendNotification);
 }
 
 void SurgeSynthEditor::showAssistantConnectionMenu()
@@ -1207,15 +1257,21 @@ void SurgeSynthEditor::showAssistantConnectionMenu()
         Surge::Assistant::Provider provider;
         juce::String model;
     };
+    struct ConnectionChoice
+    {
+        int id;
+        Surge::Assistant::Provider provider;
+    };
 
     juce::PopupMenu menu;
     menu.addSectionHeader("Assistant connection");
     menu.addItem(1, "Local fallback", true, assistantProvider == Surge::Assistant::Provider::None);
 
     std::vector<ModelChoice> choices;
+    std::vector<ConnectionChoice> connectionChoices;
     auto nextChoiceId = 100;
-    for (auto provider : {Surge::Assistant::Provider::ChatGPT, Surge::Assistant::Provider::DeepSeek,
-                          Surge::Assistant::Provider::MiniMax})
+    auto nextConnectionId = 10;
+    for (auto provider : Surge::Assistant::availableProviders())
     {
         juce::PopupMenu providerMenu;
         auto models = assistantModels[provider];
@@ -1232,9 +1288,8 @@ void SurgeSynthEditor::showAssistantConnectionMenu()
                                  provider == assistantProvider && model == assistantModel);
         }
         providerMenu.addSeparator();
-        auto configureId = provider == Surge::Assistant::Provider::ChatGPT
-                               ? 12
-                               : (provider == Surge::Assistant::Provider::DeepSeek ? 10 : 11);
+        auto configureId = nextConnectionId++;
+        connectionChoices.push_back({configureId, provider});
         providerMenu.addItem(configureId, provider == Surge::Assistant::Provider::ChatGPT
                                               ? "Sign in with ChatGPT..."
                                               : "Add or replace API key...");
@@ -1252,7 +1307,7 @@ void SurgeSynthEditor::showAssistantConnectionMenu()
         juce::PopupMenu::Options()
             .withTargetComponent(assistantConnectionButton.get())
             .withParentComponent(this),
-        [safeThis, choices](int selected) {
+        [safeThis, choices, connectionChoices](int selected) {
             if (safeThis == nullptr || selected == 0)
                 return;
             if (selected == 1)
@@ -1273,13 +1328,12 @@ void SurgeSynthEditor::showAssistantConnectionMenu()
                 safeThis->disconnectAssistantConnection();
                 return;
             }
-            if (selected == 10 || selected == 11 || selected == 12)
+            auto connection =
+                std::find_if(connectionChoices.begin(), connectionChoices.end(),
+                             [selected](const auto &choice) { return choice.id == selected; });
+            if (connection != connectionChoices.end())
             {
-                auto provider = selected == 12
-                                    ? Surge::Assistant::Provider::ChatGPT
-                                    : (selected == 10 ? Surge::Assistant::Provider::DeepSeek
-                                                      : Surge::Assistant::Provider::MiniMax);
-                safeThis->showAssistantConnectionEditor(provider);
+                safeThis->showAssistantConnectionEditor(connection->provider);
                 return;
             }
 
@@ -1306,7 +1360,9 @@ void SurgeSynthEditor::showAssistantConnectionMenu()
 
 void SurgeSynthEditor::showAssistantConnectionEditor(Surge::Assistant::Provider provider)
 {
-    if (assistantConnectionOverlay || provider == Surge::Assistant::Provider::None)
+    if (assistantConnectionOverlay || provider == Surge::Assistant::Provider::None ||
+        assistantPendingAction != AssistantPendingAction::None || assistantPatchPending ||
+        assistantClearPatchPending || assistantClearPatchConfirmationPending)
         return;
 
     assistantConnectionOverlay = std::make_unique<AssistantConnectionOverlay>(provider);
@@ -1319,19 +1375,40 @@ void SurgeSynthEditor::showAssistantConnectionEditor(Surge::Assistant::Provider 
 
     auto safeThis = juce::Component::SafePointer<SurgeSynthEditor>(this);
     assistantConnectionOverlay->onCancel = [safeThis]() {
-        juce::MessageManager::callAsync([safeThis]() {
-            if (safeThis == nullptr)
+        if (safeThis == nullptr)
+            return;
+        auto overlay = juce::Component::SafePointer<AssistantConnectionOverlay>(
+            safeThis->assistantConnectionOverlay.get());
+        if (safeThis->assistantPendingAction == AssistantPendingAction::Connect)
+        {
+            if (!safeThis->assistantClient->cancel())
+            {
+                juce::MessageManager::callAsync([safeThis]() {
+                    if (safeThis != nullptr)
+                        safeThis->pollAssistantResult();
+                });
                 return;
-            safeThis->setAssistantPromptFocus(false);
-            safeThis->assistantConnectionOverlay.reset();
-            safeThis->setAssistantWorking(false);
+            }
+            safeThis->assistantCancellationRequested = true;
+            safeThis->assistantConnectionOverlay->setCancelling();
+            return;
+        }
+        safeThis->setAssistantPromptFocus(false);
+        safeThis->assistantPrompt->setReadOnly(false);
+        safeThis->setAssistantWorking(false);
+        safeThis->assistantStatus->setText("Assistant connection cancelled.",
+                                           juce::dontSendNotification);
+        juce::MessageManager::callAsync([safeThis, overlay]() {
+            if (safeThis != nullptr &&
+                safeThis->assistantConnectionOverlay.get() == overlay.getComponent())
+                safeThis->assistantConnectionOverlay.reset();
         });
     };
 
     addAndMakeVisible(*assistantConnectionOverlay);
     assistantConnectionOverlay->setBounds(getLocalBounds());
-    assistantConnectionOverlay->toFront(true);
-    assistantPrompt->setEnabled(false);
+    assistantConnectionOverlay->toFront(false);
+    assistantPrompt->setReadOnly(true);
     assistantButton->setEnabled(false);
     assistantClearPatchButton->setEnabled(false);
     assistantConnectionButton->setEnabled(false);
@@ -1345,6 +1422,7 @@ void SurgeSynthEditor::beginAssistantConnection(Surge::Assistant::Provider provi
         return;
 
     assistantConnectionOverlay->setBusy(true);
+    assistantCancellationRequested = false;
     assistantPendingProvider = provider;
     assistantPendingAction = AssistantPendingAction::Connect;
     assistantFuture = assistantClient->connect(provider, apiKey);
@@ -1358,6 +1436,7 @@ void SurgeSynthEditor::disconnectAssistantConnection()
 
     assistantPendingProvider = assistantProvider;
     assistantPendingAction = AssistantPendingAction::Disconnect;
+    assistantCancellationRequested = false;
     assistantButton->setEnabled(false);
     assistantClearPatchButton->setEnabled(false);
     assistantConnectionButton->setEnabled(false);
@@ -1391,10 +1470,23 @@ void SurgeSynthEditor::pollAssistantResult()
 void SurgeSynthEditor::handleAssistantResult(Surge::Assistant::Result result)
 {
     auto action = assistantPendingAction;
+    auto cancellationRequested = assistantCancellationRequested;
+    assistantCancellationRequested = false;
     assistantPendingAction = AssistantPendingAction::None;
 
     if (action == AssistantPendingAction::Connect)
     {
+        if (cancellationRequested && !result.ok)
+        {
+            setAssistantPromptFocus(false);
+            assistantConnectionOverlay.reset();
+            assistantPrompt->setReadOnly(false);
+            setAssistantWorking(false);
+            assistantStatus->setText(result.error.isNotEmpty() ? result.error
+                                                               : "Assistant connection cancelled.",
+                                     juce::dontSendNotification);
+            return;
+        }
         if (!result.ok)
         {
             if (assistantConnectionOverlay)
@@ -1419,6 +1511,7 @@ void SurgeSynthEditor::handleAssistantResult(Surge::Assistant::Result result)
                                                assistantModel.toStdString());
         setAssistantPromptFocus(false);
         assistantConnectionOverlay.reset();
+        assistantPrompt->setReadOnly(false);
         setAssistantWorking(false);
         updateAssistantConnectionButton();
         auto connectionMessage =
@@ -1459,6 +1552,13 @@ void SurgeSynthEditor::handleAssistantResult(Surge::Assistant::Result result)
 
     assistantGenerationPending = false;
     setAssistantWorking(false);
+    if (cancellationRequested)
+    {
+        assistantStatus->setText(result.error.isNotEmpty() ? result.error
+                                                           : "Assistant request cancelled.",
+                                 juce::dontSendNotification);
+        return;
+    }
     if (!result.ok)
     {
         assistantStatus->setText(result.error, juce::dontSendNotification);
@@ -1471,7 +1571,12 @@ void SurgeSynthEditor::handleAssistantResult(Surge::Assistant::Result result)
                                  juce::dontSendNotification);
         return;
     }
-    applyAssistantPatchPlan(result.plan);
+    if (applyAssistantPatchPlan(result.plan))
+    {
+        processor.assistantPromptHistory.push_back(assistantRequestPrompt);
+        while (processor.assistantPromptHistory.size() > assistantConversationLimit)
+            processor.assistantPromptHistory.erase(processor.assistantPromptHistory.begin());
+    }
 }
 
 void SurgeSynthEditor::updateAssistantConnectionButton()
@@ -1580,7 +1685,7 @@ bool SurgeSynthEditor::currentPatchMatchesAssistantSnapshot() const
     return true;
 }
 
-void SurgeSynthEditor::applyAssistantPatchPlan(const Surge::Assistant::PatchPlan &plan)
+bool SurgeSynthEditor::applyAssistantPatchPlan(const Surge::Assistant::PatchPlan &plan)
 {
     auto *synth = processor.surge.get();
     auto &patch = synth->storage.getPatch();
@@ -1592,18 +1697,21 @@ void SurgeSynthEditor::applyAssistantPatchPlan(const Surge::Assistant::PatchPlan
         {
             assistantStatus->setText("The model returned an invalid patch operation.",
                                      juce::dontSendNotification);
-            return;
+            return false;
         }
-        if (std::abs(patch.param_ptr[operation.parameterId]->get_value_f01() - operation.value) >
+        auto candidate = *patch.param_ptr[operation.parameterId];
+        candidate.set_value_f01(operation.value);
+        auto canonicalValue = candidate.get_value_f01();
+        if (std::abs(patch.param_ptr[operation.parameterId]->get_value_f01() - canonicalValue) >
             1.0e-6f)
-            changes.push_back(operation);
+            changes.push_back({operation.parameterId, canonicalValue});
     }
 
     if (changes.empty())
     {
         assistantStatus->setText("The model's plan did not change any current settings.",
                                  juce::dontSendNotification);
-        return;
+        return false;
     }
 
     // A response may arrive while the user has a menu open. Close it before rebuilding
@@ -1633,6 +1741,7 @@ void SurgeSynthEditor::applyAssistantPatchPlan(const Surge::Assistant::PatchPlan
     sge->queueRebuildUI();
     assistantStatus->toFront(false);
     assistantStatus->setText(plan.summary, juce::dontSendNotification);
+    return true;
 }
 
 bool SurgeSynthEditor::isCurrentPatchUntouchedInit() const

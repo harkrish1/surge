@@ -132,6 +132,7 @@ class SurgeSynthEditor : public juce::AudioProcessorEditor,
     void beginClearPatch();
     bool enqueueDefaultPatch();
     void setAssistantWorking(bool working);
+    void cancelAssistantRequest();
     bool isCurrentPatchUntouchedInit() const;
     void applyCasioRetroKeyboardPatch();
     void applyMoreReverb();
@@ -163,8 +164,8 @@ class SurgeSynthEditor : public juce::AudioProcessorEditor,
     std::map<Surge::Assistant::Provider, std::vector<juce::String>> assistantModels;
     AssistantPatchSnapshot assistantPatchSnapshot;
     juce::String assistantRequestPrompt;
-    juce::String assistantPromptBeforeClear;
     bool assistantRequestWasFresh{false};
+    bool assistantCancellationRequested{false};
 
     void showAssistantConnectionMenu();
     void showAssistantConnectionEditor(Surge::Assistant::Provider provider);
@@ -176,7 +177,7 @@ class SurgeSynthEditor : public juce::AudioProcessorEditor,
     Surge::Assistant::PatchRequest buildAssistantPatchRequest(const juce::String &prompt,
                                                               bool freshPatch);
     bool currentPatchMatchesAssistantSnapshot() const;
-    void applyAssistantPatchPlan(const Surge::Assistant::PatchPlan &plan);
+    bool applyAssistantPatchPlan(const Surge::Assistant::PatchPlan &plan);
 
     void setPitchModSustainGUI(int pitch, int mod, int sus);
 

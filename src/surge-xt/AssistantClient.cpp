@@ -25,9 +25,12 @@
 
 #if JUCE_MAC
 #include <Security/Security.h>
-#elif JUCE_WINDOWS
+#endif
+#if JUCE_WINDOWS
 #include <windows.h>
 #include <wincred.h>
+#else
+#include <sys/stat.h>
 #endif
 
 namespace Surge
@@ -39,38 +42,68 @@ namespace
 
 constexpr auto credentialService = "org.surge-synth-team.surge-xt.assistant";
 constexpr int maximumResponseBytes = 2 * 1024 * 1024;
+constexpr int maximumDiagnosticBytes = 512 * 1024;
 
-juce::String providerBaseUrl(Provider provider)
+enum class ProviderProtocol
 {
-    switch (provider)
-    {
-    case Provider::ChatGPT:
-        return {};
-    case Provider::DeepSeek:
-        return "https://api.deepseek.com";
-    case Provider::MiniMax:
-        return "https://api.minimax.io/v1";
-    case Provider::None:
-        return {};
-    }
-    return {};
+    Local,
+    Codex,
+    OpenAIResponses,
+    OpenAICompatible,
+    Anthropic,
+};
+
+struct ProviderConfig
+{
+    Provider provider;
+    const char *id;
+    const char *displayName;
+    const char *baseUrl;
+    const char *environmentVariable;
+    const char *defaultModel;
+    const char *keyPage;
+    ProviderProtocol protocol;
+};
+
+constexpr std::array<ProviderConfig, 8> providerConfigs{{
+    {Provider::None, "none", "Local fallback", "", "", "", "", ProviderProtocol::Local},
+    {Provider::ChatGPT, "chatgpt", "ChatGPT Plus", "", "", "default",
+     "https://developers.openai.com/codex/cli", ProviderProtocol::Codex},
+    {Provider::OpenAI, "openai", "OpenAI API", "https://api.openai.com/v1", "OPENAI_API_KEY",
+     "gpt-5.4-mini", "https://platform.openai.com/api-keys", ProviderProtocol::OpenAIResponses},
+    {Provider::Anthropic, "anthropic", "Anthropic", "https://api.anthropic.com",
+     "ANTHROPIC_API_KEY", "claude-sonnet-5", "https://console.anthropic.com/settings/keys",
+     ProviderProtocol::Anthropic},
+    {Provider::Gemini, "gemini", "Google Gemini",
+     "https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY",
+     "gemini-3.6-flash", "https://aistudio.google.com/app/apikey",
+     ProviderProtocol::OpenAICompatible},
+    {Provider::OpenRouter, "openrouter", "OpenRouter", "https://openrouter.ai/api/v1",
+     "OPENROUTER_API_KEY", "openai/gpt-5.4-mini", "https://openrouter.ai/settings/keys",
+     ProviderProtocol::OpenAICompatible},
+    {Provider::DeepSeek, "deepseek", "DeepSeek", "https://api.deepseek.com", "DEEPSEEK_API_KEY",
+     "deepseek-v4-flash", "https://platform.deepseek.com/api_keys",
+     ProviderProtocol::OpenAICompatible},
+    {Provider::MiniMax, "minimax", "MiniMax", "https://api.minimax.io/v1", "MINIMAX_API_KEY",
+     "MiniMax-M3", "https://platform.minimax.io/login", ProviderProtocol::OpenAICompatible},
+}};
+
+const ProviderConfig &configFor(Provider provider)
+{
+    auto found =
+        std::find_if(providerConfigs.begin(), providerConfigs.end(),
+                     [provider](const auto &config) { return config.provider == provider; });
+    return found != providerConfigs.end() ? *found : providerConfigs.front();
 }
+
+juce::String providerBaseUrl(Provider provider) { return configFor(provider).baseUrl; }
 
 juce::String providerEnvironmentVariable(Provider provider)
 {
-    switch (provider)
-    {
-    case Provider::ChatGPT:
-        return {};
-    case Provider::DeepSeek:
-        return "DEEPSEEK_API_KEY";
-    case Provider::MiniMax:
-        return "MINIMAX_API_KEY";
-    case Provider::None:
-        return {};
-    }
-    return {};
+    return configFor(provider).environmentVariable;
 }
+
+ProviderProtocol providerProtocol(Provider provider) { return configFor(provider).protocol; }
 
 juce::String credentialAccount(Provider provider) { return "provider." + providerId(provider); }
 
@@ -84,6 +117,103 @@ struct CredentialResult
 
 std::mutex fallbackCredentialMutex;
 std::map<Provider, juce::String> fallbackCredentials;
+std::mutex diagnosticMutex;
+
+std::mutex &credentialProcessMutex(Provider provider)
+{
+    static std::array<std::mutex, providerConfigs.size()> mutexes;
+    auto index = static_cast<std::size_t>(provider);
+    return mutexes[index < mutexes.size() ? index : 0];
+}
+
+juce::InterProcessLock &credentialTransactionLock(Provider provider)
+{
+    static juce::InterProcessLock chatGPT("surge-xt-assistant-credentials-chatgpt");
+    static juce::InterProcessLock deepSeek("surge-xt-assistant-credentials-deepseek");
+    static juce::InterProcessLock miniMax("surge-xt-assistant-credentials-minimax");
+    static juce::InterProcessLock openAI("surge-xt-assistant-credentials-openai");
+    static juce::InterProcessLock anthropic("surge-xt-assistant-credentials-anthropic");
+    static juce::InterProcessLock gemini("surge-xt-assistant-credentials-gemini");
+    static juce::InterProcessLock openRouter("surge-xt-assistant-credentials-openrouter");
+    switch (provider)
+    {
+    case Provider::ChatGPT:
+        return chatGPT;
+    case Provider::DeepSeek:
+        return deepSeek;
+    case Provider::MiniMax:
+        return miniMax;
+    case Provider::OpenAI:
+        return openAI;
+    case Provider::Anthropic:
+        return anthropic;
+    case Provider::Gemini:
+        return gemini;
+    case Provider::OpenRouter:
+        return openRouter;
+    case Provider::None:
+        return openAI;
+    }
+    return openAI;
+}
+
+juce::String diagnosticDetail(juce::String text)
+{
+    text = text.replaceCharacters("\r\n\t", "   ").trim().substring(0, 240);
+    auto providerDetail = text.indexOf(": ");
+    if (providerDetail >= 0)
+        text = text.substring(0, providerDetail);
+    juce::StringArray words;
+    words.addTokens(text, " ", {});
+    for (auto &word : words)
+    {
+        if (word.length() > 48 || word.startsWithIgnoreCase("Bearer") ||
+            word.startsWithIgnoreCase("sk-") || word.startsWithIgnoreCase("AIza"))
+            word = "[redacted]";
+    }
+    return words.joinIntoString(" ");
+}
+
+void writeDiagnostic(const juce::String &action, Provider provider, const juce::String &outcome,
+                     double elapsedMilliseconds = 0.0, const juce::String &detail = {})
+{
+    std::lock_guard<std::mutex> guard(diagnosticMutex);
+    auto directory = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                         .getChildFile("Surge Synth Team")
+                         .getChildFile("Surge XT");
+    if (directory.createDirectory().failed())
+        return;
+
+    auto file = directory.getChildFile("AssistantDiagnostics.log");
+    if (file.existsAsFile() && file.getSize() > maximumDiagnosticBytes)
+    {
+        auto previous = directory.getChildFile("AssistantDiagnostics.previous.log");
+        previous.deleteFile();
+        file.moveFileTo(previous);
+    }
+
+    auto line = juce::Time::getCurrentTime().toISO8601(true) + " action=" + action +
+                " provider=" + providerId(provider) + " outcome=" + outcome;
+    if (elapsedMilliseconds > 0.0)
+        line += " elapsed_ms=" + juce::String(juce::roundToInt(elapsedMilliseconds));
+    if (detail.isNotEmpty())
+        line += " detail=\"" + diagnosticDetail(detail).replaceCharacter('"', '\'') + "\"";
+    file.appendText(line + "\n", false, false, "\n");
+}
+
+CredentialResult readEnvironmentCredential(Provider provider)
+{
+    auto environmentName = providerEnvironmentVariable(provider);
+    if (environmentName.isEmpty())
+        return {};
+    if (auto value = std::getenv(environmentName.toRawUTF8()))
+    {
+        auto key = juce::String::fromUTF8(value).trim();
+        if (key.isNotEmpty() && !key.containsAnyOf("\r\n"))
+            return {true, false, key, {}};
+    }
+    return {};
+}
 
 #if JUCE_MAC
 CFStringRef makeCFString(const juce::String &value)
@@ -125,17 +255,6 @@ CredentialResult readCredential(Provider provider)
     if (provider == Provider::None)
         return {false, false, {}, "No assistant provider is selected."};
 
-    auto environmentName = providerEnvironmentVariable(provider);
-    if (environmentName.isNotEmpty())
-    {
-        if (auto value = std::getenv(environmentName.toRawUTF8()))
-        {
-            auto key = juce::String::fromUTF8(value).trim();
-            if (key.isNotEmpty())
-                return {true, false, key, {}};
-        }
-    }
-
 #if JUCE_MAC
     auto query = makeCredentialQuery(provider);
     CFDictionarySetValue(query, kSecReturnData, kCFBooleanTrue);
@@ -145,7 +264,15 @@ CredentialResult readCredential(Provider provider)
     auto status = SecItemCopyMatching(query, &result);
     CFRelease(query);
     if (status == errSecItemNotFound)
-        return {false, true, {}, "No API key is stored for " + providerDisplayName(provider) + "."};
+    {
+        auto environment = readEnvironmentCredential(provider);
+        return environment.ok ? environment
+                              : CredentialResult{false,
+                                                 true,
+                                                 {},
+                                                 "No API key is stored for " +
+                                                     providerDisplayName(provider) + "."};
+    }
     if (status != errSecSuccess || result == nullptr || CFGetTypeID(result) != CFDataGetTypeID())
     {
         if (result != nullptr)
@@ -157,8 +284,9 @@ CredentialResult readCredential(Provider provider)
     auto key = juce::String::fromUTF8(reinterpret_cast<const char *>(CFDataGetBytePtr(data)),
                                       static_cast<int>(CFDataGetLength(data)));
     CFRelease(result);
-    return key.isNotEmpty() ? CredentialResult{true, true, key, {}}
-                            : CredentialResult{false, true, {}, "The stored API key is empty."};
+    return key.isNotEmpty() && !key.containsAnyOf("\r\n")
+               ? CredentialResult{true, true, key, {}}
+               : CredentialResult{false, true, {}, "The stored API key is invalid."};
 #elif JUCE_WINDOWS
     auto target = juce::String(credentialService) + "." + credentialAccount(provider);
     PCREDENTIALW credential = nullptr;
@@ -166,25 +294,38 @@ CredentialResult readCredential(Provider provider)
     {
         auto code = GetLastError();
         if (code == ERROR_NOT_FOUND)
-            return {
-                false, true, {}, "No API key is stored for " + providerDisplayName(provider) + "."};
+        {
+            auto environment = readEnvironmentCredential(provider);
+            return environment.ok ? environment
+                                  : CredentialResult{false,
+                                                     true,
+                                                     {},
+                                                     "No API key is stored for " +
+                                                         providerDisplayName(provider) + "."};
+        }
         return {false, true, {}, "Credential Manager read failed: " + juce::String(code)};
     }
 
     auto key = juce::String::fromUTF8(reinterpret_cast<const char *>(credential->CredentialBlob),
                                       static_cast<int>(credential->CredentialBlobSize));
     CredFree(credential);
-    return key.isNotEmpty() ? CredentialResult{true, true, key, {}}
-                            : CredentialResult{false, true, {}, "The stored API key is empty."};
+    return key.isNotEmpty() && !key.containsAnyOf("\r\n")
+               ? CredentialResult{true, true, key, {}}
+               : CredentialResult{false, true, {}, "The stored API key is invalid."};
 #else
-    std::lock_guard<std::mutex> guard(fallbackCredentialMutex);
-    auto found = fallbackCredentials.find(provider);
-    if (found == fallbackCredentials.end())
-        return {false,
-                false,
-                {},
-                "No session API key is stored for " + providerDisplayName(provider) + "."};
-    return {true, false, found->second, {}};
+    {
+        std::lock_guard<std::mutex> guard(fallbackCredentialMutex);
+        auto found = fallbackCredentials.find(provider);
+        if (found != fallbackCredentials.end())
+            return {true, false, found->second, {}};
+    }
+    auto environment = readEnvironmentCredential(provider);
+    return environment.ok ? environment
+                          : CredentialResult{false,
+                                             false,
+                                             {},
+                                             "No session API key is stored for " +
+                                                 providerDisplayName(provider) + "."};
 #endif
 }
 
@@ -391,6 +532,25 @@ juce::String buildUserPrompt(const PatchRequest &request)
            juce::JSON::toString(juce::var(catalog), true);
 }
 
+juce::String buildPatchPlanSchema(const PatchRequest &request, bool includeLocalConstraints = true);
+
+juce::var buildStructuredResponseFormat(const PatchRequest &request)
+{
+    juce::var schema;
+    if (juce::JSON::parse(buildPatchPlanSchema(request), schema).failed())
+        return {};
+
+    auto jsonSchema = new juce::DynamicObject();
+    jsonSchema->setProperty("name", "surge_xt_patch_plan");
+    jsonSchema->setProperty("strict", true);
+    jsonSchema->setProperty("schema", schema);
+
+    auto responseFormat = new juce::DynamicObject();
+    responseFormat->setProperty("type", "json_schema");
+    responseFormat->setProperty("json_schema", juce::var(jsonSchema));
+    return juce::var(responseFormat);
+}
+
 juce::String buildChatRequest(const PatchRequest &request)
 {
     juce::Array<juce::var> messages;
@@ -404,22 +564,61 @@ juce::String buildChatRequest(const PatchRequest &request)
     user->setProperty("content", buildUserPrompt(request));
     messages.add(juce::var(user));
 
-    auto responseFormat = new juce::DynamicObject();
-    responseFormat->setProperty("type", "json_object");
-
     auto root = new juce::DynamicObject();
     root->setProperty("model", request.model);
     root->setProperty("messages", juce::var(messages));
     root->setProperty("stream", false);
-    root->setProperty("temperature", request.freshPatch ? 0.35 : 0.15);
-    root->setProperty("max_tokens", request.freshPatch ? 4096 : 2048);
-    root->setProperty("response_format", juce::var(responseFormat));
+    if (request.provider == Provider::OpenAI)
+        root->setProperty("max_completion_tokens", request.freshPatch ? 4096 : 2048);
+    else
+        root->setProperty("max_tokens", request.freshPatch ? 4096 : 2048);
+
+    if (request.provider == Provider::DeepSeek || request.provider == Provider::MiniMax)
+    {
+        auto responseFormat = new juce::DynamicObject();
+        responseFormat->setProperty("type", "json_object");
+        root->setProperty("response_format", juce::var(responseFormat));
+        root->setProperty("temperature", request.freshPatch ? 0.35 : 0.15);
+    }
+    else
+    {
+        root->setProperty("response_format", buildStructuredResponseFormat(request));
+    }
+
+    if (request.provider == Provider::OpenRouter)
+    {
+        auto preferences = new juce::DynamicObject();
+        preferences->setProperty("require_parameters", true);
+        root->setProperty("provider", juce::var(preferences));
+    }
     if (request.provider == Provider::MiniMax)
         root->setProperty("reasoning_split", true);
     return juce::JSON::toString(juce::var(root), true);
 }
 
-juce::String buildPatchPlanSchema(const PatchRequest &request)
+juce::String buildOpenAIResponseRequest(const PatchRequest &request)
+{
+    juce::var schema;
+    juce::JSON::parse(buildPatchPlanSchema(request), schema);
+
+    auto format = new juce::DynamicObject();
+    format->setProperty("type", "json_schema");
+    format->setProperty("name", "surge_xt_patch_plan");
+    format->setProperty("strict", true);
+    format->setProperty("schema", schema);
+    auto text = new juce::DynamicObject();
+    text->setProperty("format", juce::var(format));
+
+    auto root = new juce::DynamicObject();
+    root->setProperty("model", request.model);
+    root->setProperty("instructions", buildSystemPrompt(request.freshPatch));
+    root->setProperty("input", buildUserPrompt(request));
+    root->setProperty("text", juce::var(text));
+    root->setProperty("max_output_tokens", request.freshPatch ? 4096 : 2048);
+    return juce::JSON::toString(juce::var(root), true);
+}
+
+juce::String buildPatchPlanSchema(const PatchRequest &request, bool includeLocalConstraints)
 {
     juce::Array<juce::var> parameterIds;
     for (const auto &parameter : request.parameters)
@@ -431,8 +630,11 @@ juce::String buildPatchPlanSchema(const PatchRequest &request)
 
     auto valueProperty = new juce::DynamicObject();
     valueProperty->setProperty("type", "number");
-    valueProperty->setProperty("minimum", 0.0);
-    valueProperty->setProperty("maximum", 1.0);
+    if (includeLocalConstraints)
+    {
+        valueProperty->setProperty("minimum", 0.0);
+        valueProperty->setProperty("maximum", 1.0);
+    }
 
     auto operationProperties = new juce::DynamicObject();
     operationProperties->setProperty("parameter_id", juce::var(idProperty));
@@ -447,15 +649,19 @@ juce::String buildPatchPlanSchema(const PatchRequest &request)
 
     auto name = new juce::DynamicObject();
     name->setProperty("type", "string");
-    name->setProperty("maxLength", 64);
     auto summary = new juce::DynamicObject();
     summary->setProperty("type", "string");
-    summary->setProperty("maxLength", 180);
+    if (includeLocalConstraints)
+    {
+        name->setProperty("maxLength", 64);
+        summary->setProperty("maxLength", 180);
+    }
     auto operations = new juce::DynamicObject();
     operations->setProperty("type", "array");
     operations->setProperty("items", juce::var(operation));
     operations->setProperty("minItems", 1);
-    operations->setProperty("maxItems", request.freshPatch ? 128 : 32);
+    if (includeLocalConstraints)
+        operations->setProperty("maxItems", request.freshPatch ? 128 : 32);
 
     auto properties = new juce::DynamicObject();
     properties->setProperty("name", juce::var(name));
@@ -469,6 +675,45 @@ juce::String buildPatchPlanSchema(const PatchRequest &request)
     root->setProperty("required", juce::var(required));
     root->setProperty("additionalProperties", false);
     return juce::JSON::toString(juce::var(root), true);
+}
+
+juce::String buildAnthropicRequest(const PatchRequest &request)
+{
+    juce::Array<juce::var> messages;
+    auto user = new juce::DynamicObject();
+    user->setProperty("role", "user");
+    user->setProperty("content", buildUserPrompt(request));
+    messages.add(juce::var(user));
+
+    juce::var schema;
+    juce::JSON::parse(buildPatchPlanSchema(request, false), schema);
+    auto format = new juce::DynamicObject();
+    format->setProperty("type", "json_schema");
+    format->setProperty("schema", schema);
+    auto outputConfig = new juce::DynamicObject();
+    outputConfig->setProperty("format", juce::var(format));
+
+    auto root = new juce::DynamicObject();
+    root->setProperty("model", request.model);
+    root->setProperty("system", buildSystemPrompt(request.freshPatch));
+    root->setProperty("messages", juce::var(messages));
+    root->setProperty("max_tokens", request.freshPatch ? 4096 : 2048);
+    root->setProperty("stream", false);
+    root->setProperty("output_config", juce::var(outputConfig));
+    return juce::JSON::toString(juce::var(root), true);
+}
+
+bool isNativeExecutable(const juce::File &file)
+{
+    juce::FileInputStream input(file);
+    std::array<unsigned char, 4> magic{};
+    if (!input.openedOk() ||
+        input.read(magic.data(), static_cast<int>(magic.size())) != static_cast<int>(magic.size()))
+        return false;
+    auto matches = [&magic](std::array<unsigned char, 4> expected) { return magic == expected; };
+    return matches({0x7f, 'E', 'L', 'F'}) || (magic[0] == 'M' && magic[1] == 'Z') ||
+           matches({0xcf, 0xfa, 0xed, 0xfe}) || matches({0xfe, 0xed, 0xfa, 0xcf}) ||
+           matches({0xca, 0xfe, 0xba, 0xbe}) || matches({0xbe, 0xba, 0xfe, 0xca});
 }
 
 juce::File findCodexExecutable()
@@ -485,8 +730,9 @@ juce::File findCodexExecutable()
     candidates.emplace_back("/usr/local/bin/codex");
     candidates.emplace_back("/usr/bin/codex");
 
-    auto found = std::find_if(candidates.begin(), candidates.end(),
-                              [](const auto &candidate) { return candidate.existsAsFile(); });
+    auto found = std::find_if(candidates.begin(), candidates.end(), [](const auto &candidate) {
+        return candidate.existsAsFile() && isNativeExecutable(candidate);
+    });
     return found != candidates.end() ? *found : juce::File{};
 }
 
@@ -502,7 +748,42 @@ struct ScopedDirectoryRemoval
     juce::File directory;
 };
 
-std::vector<juce::String> parseModelList(const juce::String &body, juce::String &error)
+bool isSupportedTextModel(Provider provider, const juce::String &model)
+{
+    auto id = model.toLowerCase();
+    auto excluded = id.contains("embedding") || id.contains("moderation") ||
+                    id.contains("transcri") || id.contains("whisper") || id.contains("tts") ||
+                    id.contains("audio") || id.contains("realtime") || id.contains("image");
+    if (excluded)
+        return false;
+
+    switch (provider)
+    {
+    case Provider::DeepSeek:
+        return id.startsWith("deepseek-");
+    case Provider::MiniMax:
+        return id.startsWith("minimax-m");
+    case Provider::OpenAI:
+        return !id.contains("search-preview") && !id.contains("deep-research") &&
+               !id.contains("codex") && !(id.startsWith("gpt-5") && id.contains("-pro")) &&
+               id != "gpt-4o-2024-05-13" &&
+               (id.startsWith("gpt-5") || id.startsWith("gpt-4.1") || id.startsWith("gpt-4o") ||
+                id.startsWith("o3") || id.startsWith("o4"));
+    case Provider::Anthropic:
+        return id.startsWith("claude-");
+    case Provider::Gemini:
+        return id.startsWith("gemini-");
+    case Provider::OpenRouter:
+        return id.containsChar('/') && !id.endsWith(":batch");
+    case Provider::None:
+    case Provider::ChatGPT:
+        return false;
+    }
+    return false;
+}
+
+std::vector<juce::String> parseModelList(const juce::String &body, Provider provider,
+                                         juce::String &error)
 {
     juce::var root;
     auto parsed = juce::JSON::parse(body, root);
@@ -513,6 +794,8 @@ std::vector<juce::String> parseModelList(const juce::String &body, juce::String 
     }
 
     auto data = root.getProperty("data", {});
+    if (data.getArray() == nullptr)
+        data = root.getProperty("models", {});
     auto array = data.getArray();
     if (array == nullptr)
     {
@@ -521,100 +804,107 @@ std::vector<juce::String> parseModelList(const juce::String &body, juce::String 
     }
 
     std::set<juce::String> unique;
+    std::vector<juce::String> models;
     for (const auto &entry : *array)
     {
-        auto id = entry.getDynamicObject() != nullptr
-                      ? entry.getDynamicObject()->getProperty("id").toString().trim()
-                      : entry.toString().trim();
-        if (id.isNotEmpty() && id.length() <= 160)
-            unique.insert(id);
-        if (unique.size() >= 300)
+        auto object = entry.getDynamicObject();
+        auto id = object != nullptr ? object->getProperty("id").toString().trim()
+                                    : entry.toString().trim();
+        if (id.isEmpty() && object != nullptr)
+            id = object->getProperty("name").toString().trim();
+        if (provider == Provider::Gemini && id.startsWithIgnoreCase("models/"))
+            id = id.substring(7);
+
+        if (provider == Provider::Gemini && object != nullptr)
+        {
+            if (auto methods = object->getProperty("supportedGenerationMethods").getArray())
+            {
+                auto supportsGeneration =
+                    std::any_of(methods->begin(), methods->end(), [](const auto &method) {
+                        return method.toString().equalsIgnoreCase("generateContent");
+                    });
+                if (!supportsGeneration)
+                    continue;
+            }
+        }
+
+        if (provider == Provider::Anthropic && object != nullptr)
+        {
+            if (auto capabilities = object->getProperty("capabilities").getDynamicObject())
+            {
+                if (auto structured =
+                        capabilities->getProperty("structured_outputs").getDynamicObject())
+                    if (!static_cast<bool>(structured->getProperty("supported")))
+                        continue;
+            }
+        }
+
+        if (provider == Provider::OpenRouter && object != nullptr)
+        {
+            auto parameters = object->getProperty("supported_parameters").getArray();
+            if (parameters == nullptr)
+                continue;
+            auto supportsStructuredOutput =
+                std::any_of(parameters->begin(), parameters->end(), [](const auto &parameter) {
+                    return parameter.toString() == "structured_outputs";
+                });
+            auto supportsTokenLimit =
+                std::any_of(parameters->begin(), parameters->end(), [](const auto &parameter) {
+                    return parameter.toString() == "max_tokens";
+                });
+            if (!supportsStructuredOutput || !supportsTokenLimit)
+                continue;
+        }
+
+        if (id.isNotEmpty() && id.length() <= 160 && isSupportedTextModel(provider, id) &&
+            unique.insert(id).second)
+            models.push_back(id);
+        if (models.size() >= (provider == Provider::OpenRouter ? 1000U : 300U))
             break;
     }
 
-    if (unique.empty())
+    if (models.empty())
     {
         error = "The connected account did not return any available models.";
         return {};
     }
-    return {unique.begin(), unique.end()};
+
+    auto preferred = providerDefaultModel(provider);
+    auto foundPreferred = std::find(models.begin(), models.end(), preferred);
+    if (foundPreferred != models.end() && foundPreferred != models.begin())
+        std::rotate(models.begin(), foundPreferred, foundPreferred + 1);
+
+    auto maximumModels = provider == Provider::OpenRouter ? 1000U : 100U;
+    if (models.size() > maximumModels)
+        models.resize(maximumModels);
+    return models;
 }
 
 } // namespace
 
-juce::String providerId(Provider provider)
+std::vector<Provider> availableProviders()
 {
-    switch (provider)
-    {
-    case Provider::ChatGPT:
-        return "chatgpt";
-    case Provider::DeepSeek:
-        return "deepseek";
-    case Provider::MiniMax:
-        return "minimax";
-    case Provider::None:
-        return "none";
-    }
-    return "none";
+    std::vector<Provider> providers;
+    providers.reserve(providerConfigs.size() - 1);
+    for (const auto &config : providerConfigs)
+        if (config.provider != Provider::None)
+            providers.push_back(config.provider);
+    return providers;
 }
 
-juce::String providerDisplayName(Provider provider)
-{
-    switch (provider)
-    {
-    case Provider::ChatGPT:
-        return "ChatGPT Plus";
-    case Provider::DeepSeek:
-        return "DeepSeek";
-    case Provider::MiniMax:
-        return "MiniMax";
-    case Provider::None:
-        return "Local fallback";
-    }
-    return "Local fallback";
-}
+juce::String providerId(Provider provider) { return configFor(provider).id; }
 
-juce::String providerDefaultModel(Provider provider)
-{
-    switch (provider)
-    {
-    case Provider::ChatGPT:
-        return "default";
-    case Provider::DeepSeek:
-        return "deepseek-v4-flash";
-    case Provider::MiniMax:
-        return "MiniMax-M3";
-    case Provider::None:
-        return {};
-    }
-    return {};
-}
+juce::String providerDisplayName(Provider provider) { return configFor(provider).displayName; }
 
-juce::String providerKeyPage(Provider provider)
-{
-    switch (provider)
-    {
-    case Provider::ChatGPT:
-        return "https://developers.openai.com/codex/cli";
-    case Provider::DeepSeek:
-        return "https://platform.deepseek.com/api_keys";
-    case Provider::MiniMax:
-        return "https://platform.minimax.io/login";
-    case Provider::None:
-        return {};
-    }
-    return {};
-}
+juce::String providerDefaultModel(Provider provider) { return configFor(provider).defaultModel; }
+
+juce::String providerKeyPage(Provider provider) { return configFor(provider).keyPage; }
 
 Provider providerFromId(const juce::String &id)
 {
-    if (id.equalsIgnoreCase("chatgpt"))
-        return Provider::ChatGPT;
-    if (id.equalsIgnoreCase("deepseek"))
-        return Provider::DeepSeek;
-    if (id.equalsIgnoreCase("minimax"))
-        return Provider::MiniMax;
-    return Provider::None;
+    auto found = std::find_if(providerConfigs.begin(), providerConfigs.end(),
+                              [&](const auto &config) { return id.equalsIgnoreCase(config.id); });
+    return found != providerConfigs.end() ? found->provider : Provider::None;
 }
 
 juce::String modelDisplayName(Provider provider, const juce::String &model)
@@ -737,13 +1027,153 @@ Result parseChatCompletion(const juce::String &response, bool freshPatch,
     }
 
     auto choice = choices->getReference(0).getDynamicObject();
+    auto finishReason =
+        choice != nullptr ? choice->getProperty("finish_reason").toString() : juce::String{};
+    if (finishReason.equalsIgnoreCase("length"))
+    {
+        result.error =
+            "The provider reached its response token limit before completing the patch plan.";
+        return result;
+    }
+    if (finishReason.isNotEmpty() && !finishReason.equalsIgnoreCase("stop"))
+    {
+        result.error = "The provider did not complete the patch plan (" +
+                       sanitizedText(finishReason, 80) + ").";
+        return result;
+    }
     auto message = choice != nullptr ? choice->getProperty("message").getDynamicObject() : nullptr;
+    auto refusal = message != nullptr ? message->getProperty("refusal").toString() : juce::String{};
+    if (refusal.isNotEmpty())
+    {
+        result.error = "The provider declined to create this patch.";
+        return result;
+    }
     auto content = message != nullptr ? message->getProperty("content").toString() : juce::String{};
     if (content.isEmpty())
     {
         result.error = "The provider returned an empty model answer.";
         return result;
     }
+    return parsePatchPlanJson(content, freshPatch, allowedParameterIds);
+}
+
+Result parseOpenAIResponse(const juce::String &response, bool freshPatch,
+                           const std::set<int> &allowedParameterIds)
+{
+    Result result;
+    result.kind = ResultKind::Generation;
+
+    juce::var root;
+    auto parsed = juce::JSON::parse(response, root);
+    if (parsed.failed())
+    {
+        result.error = "OpenAI returned invalid JSON: " + parsed.getErrorMessage();
+        return result;
+    }
+
+    auto status = root.getProperty("status", {}).toString();
+    if (status.isNotEmpty() && status != "completed")
+    {
+        auto reason =
+            root.getProperty("incomplete_details", {}).getProperty("reason", {}).toString();
+        result.error =
+            status == "incomplete" && reason == "max_output_tokens"
+                ? "OpenAI reached the response token limit before completing the patch plan."
+                : "OpenAI did not complete the patch plan.";
+        return result;
+    }
+
+    juce::String content;
+    bool refused = false;
+    if (auto output = root.getProperty("output", {}).getArray())
+    {
+        for (const auto &outputValue : *output)
+        {
+            auto message = outputValue.getDynamicObject();
+            if (message == nullptr || message->getProperty("type").toString() != "message")
+                continue;
+            if (auto blocks = message->getProperty("content").getArray())
+            {
+                for (const auto &blockValue : *blocks)
+                {
+                    auto block = blockValue.getDynamicObject();
+                    if (block == nullptr)
+                        continue;
+                    auto type = block->getProperty("type").toString();
+                    if (type == "output_text")
+                        content += block->getProperty("text").toString();
+                    else if (type == "refusal")
+                        refused = true;
+                }
+            }
+        }
+    }
+    if (refused)
+    {
+        result.error = "OpenAI declined to create this patch.";
+        return result;
+    }
+    if (content.isEmpty())
+    {
+        result.error = "OpenAI returned an empty model answer.";
+        return result;
+    }
+    return parsePatchPlanJson(content, freshPatch, allowedParameterIds);
+}
+
+Result parseAnthropicMessage(const juce::String &response, bool freshPatch,
+                             const std::set<int> &allowedParameterIds)
+{
+    Result result;
+    result.kind = ResultKind::Generation;
+
+    juce::var root;
+    auto parsed = juce::JSON::parse(response, root);
+    if (parsed.failed())
+    {
+        result.error = "Anthropic returned invalid JSON: " + parsed.getErrorMessage();
+        return result;
+    }
+
+    auto stopReason = root.getProperty("stop_reason", {}).toString();
+    if (stopReason == "max_tokens")
+    {
+        result.error =
+            "Anthropic reached the response token limit before completing the patch plan.";
+        return result;
+    }
+    if (stopReason == "refusal")
+    {
+        result.error = "Anthropic declined to create this patch.";
+        return result;
+    }
+    if (stopReason.isNotEmpty() && stopReason != "end_turn" && stopReason != "stop_sequence")
+    {
+        result.error =
+            "Anthropic did not complete the patch plan (" + sanitizedText(stopReason, 80) + ").";
+        return result;
+    }
+
+    auto blocks = root.getProperty("content", {}).getArray();
+    if (blocks == nullptr)
+    {
+        result.error = "Anthropic's response did not contain a model answer.";
+        return result;
+    }
+
+    juce::String content;
+    for (const auto &blockValue : *blocks)
+    {
+        auto block = blockValue.getDynamicObject();
+        if (block != nullptr && block->getProperty("type").toString() == "text")
+            content += block->getProperty("text").toString();
+    }
+    if (content.isEmpty())
+    {
+        result.error = "Anthropic returned an empty model answer.";
+        return result;
+    }
+
     return parsePatchPlanJson(content, freshPatch, allowedParameterIds);
 }
 
@@ -757,6 +1187,10 @@ class Client::Impl
         {
             std::lock_guard<std::mutex> guard(queueMutex);
             stopping = true;
+            if (activeJob || !jobs.empty())
+                cancellationEpoch.fetch_add(1);
+            cancelActiveRequest();
+            cancelActiveProcess();
             while (!jobs.empty())
             {
                 auto result = failure(jobs.front()->kind, "The assistant request was cancelled.");
@@ -764,8 +1198,6 @@ class Client::Impl
                 jobs.pop_front();
             }
         }
-        cancelActiveRequest();
-        cancelActiveProcess();
         queueCondition.notify_all();
         if (worker.joinable())
             worker.join();
@@ -800,10 +1232,18 @@ class Client::Impl
         return enqueue(std::move(job));
     }
 
-    void cancel()
+    bool cancel()
     {
+        bool cancelled = false;
         {
             std::lock_guard<std::mutex> guard(queueMutex);
+            cancelled = activeJob || !jobs.empty();
+            if (cancelled)
+            {
+                cancellationEpoch.fetch_add(1);
+                cancelActiveRequest();
+                cancelActiveProcess();
+            }
             while (!jobs.empty())
             {
                 auto result = failure(jobs.front()->kind, "The assistant request was cancelled.");
@@ -811,8 +1251,7 @@ class Client::Impl
                 jobs.pop_front();
             }
         }
-        cancelActiveRequest();
-        cancelActiveProcess();
+        return cancelled;
     }
 
   private:
@@ -823,6 +1262,25 @@ class Client::Impl
         Generate,
     };
 
+    struct CredentialTransactionGuard
+    {
+        ~CredentialTransactionGuard() { release(); }
+
+        void release()
+        {
+            if (interProcess != nullptr)
+            {
+                interProcess->exit();
+                interProcess = nullptr;
+            }
+            if (process.owns_lock())
+                process.unlock();
+        }
+
+        std::unique_lock<std::mutex> process;
+        juce::InterProcessLock *interProcess{nullptr};
+    };
+
     struct Job
     {
         JobType type{JobType::Generate};
@@ -830,6 +1288,12 @@ class Client::Impl
         Provider provider{Provider::None};
         juce::String key;
         PatchRequest request;
+        std::uint64_t generation{0};
+        bool codexWasLoggedIn{false};
+        bool codexLoginAttempted{false};
+        bool codexLogoutAttempted{false};
+        bool irreversibleMutationCommitted{false};
+        CredentialTransactionGuard credentialTransaction;
         std::promise<Result> promise;
     };
 
@@ -845,6 +1309,8 @@ class Client::Impl
         uint32_t exitCode{1};
         juce::String output;
         juce::String error;
+        bool cancelled{false};
+        bool timedOut{false};
     };
 
     static Result failure(ResultKind kind, const juce::String &error)
@@ -866,10 +1332,53 @@ class Client::Impl
                     failure(job->kind, "The assistant service is shutting down."));
                 return future;
             }
+            job->generation = cancellationEpoch.load();
             jobs.push_back(std::move(job));
         }
         queueCondition.notify_one();
         return future;
+    }
+
+    bool isCancelled(const Job &job) const { return job.generation != cancellationEpoch.load(); }
+
+    bool acquireCredentialTransaction(Provider provider, std::uint64_t generation,
+                                      CredentialTransactionGuard &guard, juce::String &error)
+    {
+        constexpr double maximumWaitMilliseconds = 30000.0;
+        auto started = juce::Time::getMillisecondCounterHiRes();
+        guard.process =
+            std::unique_lock<std::mutex>(credentialProcessMutex(provider), std::defer_lock);
+        while (!guard.process.try_lock())
+        {
+            if (generation != cancellationEpoch.load())
+            {
+                error = "The assistant request was cancelled.";
+                return false;
+            }
+            if (juce::Time::getMillisecondCounterHiRes() - started >= maximumWaitMilliseconds)
+            {
+                error = "Another Surge XT instance is updating this assistant connection.";
+                return false;
+            }
+            juce::Thread::sleep(20);
+        }
+
+        auto &interProcess = credentialTransactionLock(provider);
+        while (!interProcess.enter(100))
+        {
+            if (generation != cancellationEpoch.load())
+            {
+                error = "The assistant request was cancelled.";
+                return false;
+            }
+            if (juce::Time::getMillisecondCounterHiRes() - started >= maximumWaitMilliseconds)
+            {
+                error = "Another Surge XT process is updating this assistant connection.";
+                return false;
+            }
+        }
+        guard.interProcess = &interProcess;
+        return true;
     }
 
     void cancelActiveRequest()
@@ -886,9 +1395,82 @@ class Client::Impl
             activeProcess->kill();
     }
 
-    ProcessResponse runProcess(const juce::StringArray &arguments)
+    static bool codexStatusSaysLoggedOut(const ProcessResponse &status)
+    {
+        return status.output.containsIgnoreCase("not logged in") ||
+               status.output.containsIgnoreCase("not authenticated") ||
+               status.output.containsIgnoreCase("no login");
+    }
+
+    juce::String settleCodexCancellation(Job &job)
+    {
+        if (job.provider == Provider::ChatGPT && job.codexLoginAttempted && !job.codexWasLoggedIn)
+        {
+            auto codex = findCodexExecutable();
+            if (!codex.existsAsFile())
+                return "The Codex runtime could not be found to restore the previous login state.";
+            auto generation = cancellationEpoch.load();
+            auto status =
+                runProcess({codex.getFullPathName(), "login", "status"}, generation, 15000);
+            if (status.cancelled || status.timedOut)
+                return "Codex login status could not be checked while restoring the previous login "
+                       "state.";
+            if (status.exitCode == 0 && status.output.containsIgnoreCase("ChatGPT"))
+            {
+                auto logout = runProcess({codex.getFullPathName(), "logout"}, generation, 15000);
+                if (logout.cancelled || logout.timedOut || logout.exitCode != 0)
+                    return "Codex sign-out failed while restoring the previous login state.";
+            }
+            else if (status.exitCode == 0 || !codexStatusSaysLoggedOut(status))
+            {
+                return "Codex returned an unknown login state while restoring authentication.";
+            }
+            job.codexLoginAttempted = false;
+            return {};
+        }
+        if (job.provider == Provider::ChatGPT && job.codexLogoutAttempted)
+        {
+            auto codex = findCodexExecutable();
+            if (!codex.existsAsFile())
+                return "The Codex runtime could not be found to verify sign-out.";
+            auto generation = cancellationEpoch.load();
+            auto logout = runProcess({codex.getFullPathName(), "logout"}, generation, 15000);
+            if (!logout.cancelled && !logout.timedOut && logout.exitCode == 0)
+            {
+                job.irreversibleMutationCommitted = true;
+                return {};
+            }
+            if (logout.cancelled || logout.timedOut)
+                return "Codex sign-out could not be completed after cancellation.";
+
+            auto status =
+                runProcess({codex.getFullPathName(), "login", "status"}, generation, 15000);
+            if (status.cancelled || status.timedOut)
+                return "Codex login status could not be checked after sign-out.";
+            if (codexStatusSaysLoggedOut(status))
+            {
+                job.irreversibleMutationCommitted = true;
+                return {};
+            }
+            if (status.exitCode == 0 && status.output.containsIgnoreCase("ChatGPT"))
+                return {};
+            return "Codex returned an unknown login state after sign-out.";
+        }
+        return {};
+    }
+
+    ProcessResponse runProcess(const juce::StringArray &arguments, std::uint64_t generation,
+                               int timeoutMilliseconds = 300000)
     {
         ProcessResponse response;
+        if (generation != cancellationEpoch.load())
+        {
+            response.cancelled = true;
+            response.error = "The assistant request was cancelled.";
+            response.output = response.error;
+            return response;
+        }
+
         auto process = std::make_unique<juce::ChildProcess>();
         if (!process->start(arguments))
         {
@@ -901,24 +1483,58 @@ class Client::Impl
             std::lock_guard<std::mutex> guard(processMutex);
             activeProcess = process.get();
         }
+        if (generation != cancellationEpoch.load())
+        {
+            response.cancelled = true;
+            process->kill();
+        }
 
         juce::MemoryOutputStream output;
-        std::array<char, 4096> buffer{};
-        for (;;)
-        {
-            auto bytesRead =
-                process->readProcessOutput(buffer.data(), static_cast<int>(buffer.size()));
-            if (bytesRead <= 0)
-                break;
-            if (output.getDataSize() < maximumResponseBytes)
+        std::thread reader([&process, &output]() {
+            std::array<char, 4096> buffer{};
+            for (;;)
             {
-                auto remaining = maximumResponseBytes - static_cast<int>(output.getDataSize());
-                output.write(buffer.data(), static_cast<size_t>(std::min(bytesRead, remaining)));
+                auto bytesRead =
+                    process->readProcessOutput(buffer.data(), static_cast<int>(buffer.size()));
+                if (bytesRead <= 0)
+                    break;
+                if (output.getDataSize() < maximumResponseBytes)
+                {
+                    auto remaining = maximumResponseBytes - static_cast<int>(output.getDataSize());
+                    output.write(buffer.data(),
+                                 static_cast<size_t>(std::min(bytesRead, remaining)));
+                }
             }
+        });
+
+        auto started = juce::Time::getMillisecondCounterHiRes();
+        while (!response.cancelled)
+        {
+            if (generation != cancellationEpoch.load())
+            {
+                response.cancelled = true;
+                process->kill();
+                break;
+            }
+            if (!process->isRunning())
+                break;
+            if (juce::Time::getMillisecondCounterHiRes() - started >= timeoutMilliseconds)
+            {
+                response.timedOut = true;
+                process->kill();
+                break;
+            }
+            juce::Thread::sleep(20);
         }
+
+        reader.join();
         process->waitForProcessToFinish(1000);
         response.exitCode = process->getExitCode();
         response.output = output.toString();
+        if (response.cancelled)
+            response.error = "The assistant request was cancelled.";
+        else if (response.timedOut)
+            response.error = "The Codex runtime did not finish in time.";
 
         {
             std::lock_guard<std::mutex> guard(processMutex);
@@ -927,26 +1543,51 @@ class Client::Impl
         return response;
     }
 
-    HttpResponse performHttp(const juce::String &url, const juce::String &method,
-                             const juce::String &key, const juce::String &body = {})
+    static juce::String requestHeaders(Provider provider, const juce::String &url,
+                                       const juce::String &key)
+    {
+        juce::String headers = "Accept: application/json\r\nContent-Type: application/json\r\n"
+                               "User-Agent: Surge-XT-Assistant\r\n";
+        if (provider == Provider::Anthropic)
+            headers += "x-api-key: " + key + "\r\nanthropic-version: 2023-06-01\r\n";
+        else if (provider == Provider::Gemini && !url.contains("/openai"))
+            headers += "x-goog-api-key: " + key + "\r\n";
+        else
+            headers += "Authorization: Bearer " + key + "\r\n";
+
+        if (provider == Provider::OpenRouter)
+            headers += "HTTP-Referer: https://surge-synth-team.org/\r\n"
+                       "X-OpenRouter-Title: Surge XT\r\n";
+        return headers;
+    }
+
+    HttpResponse performHttp(Provider provider, const juce::String &url, const juce::String &method,
+                             const juce::String &key, const juce::String &body,
+                             std::uint64_t generation)
     {
         HttpResponse response;
+        if (generation != cancellationEpoch.load())
+        {
+            response.error = "The assistant request was cancelled.";
+            return response;
+        }
+
         auto requestUrl = juce::URL(url);
         if (method == "POST")
             requestUrl = requestUrl.withPOSTData(body);
 
         auto stream = std::make_unique<juce::WebInputStream>(requestUrl, method == "POST");
         stream->withCustomRequestCommand(method)
-            .withConnectionTimeout(30000)
-            .withNumRedirectsToFollow(2)
-            .withExtraHeaders("Authorization: Bearer " + key +
-                              "\r\nAccept: application/json\r\nContent-Type: application/json\r\n"
-                              "User-Agent: Surge-XT-Assistant\r\n");
+            .withConnectionTimeout(method == "POST" ? 120000 : 30000)
+            .withNumRedirectsToFollow(0)
+            .withExtraHeaders(requestHeaders(provider, url, key));
 
         {
             std::lock_guard<std::mutex> guard(streamMutex);
             activeStream = stream.get();
         }
+        if (generation != cancellationEpoch.load())
+            stream->cancel();
 
         auto connected = stream->connect(nullptr);
         response.statusCode = stream->getStatusCode();
@@ -978,8 +1619,11 @@ class Client::Impl
         return response;
     }
 
-    Result processConnect(const Job &job)
+    Result processConnect(Job &job)
     {
+        if (isCancelled(job))
+            return failure(ResultKind::Connection, "The assistant request was cancelled.");
+
         Result result;
         result.kind = ResultKind::Connection;
 
@@ -989,23 +1633,59 @@ class Client::Impl
             if (!codex.existsAsFile())
             {
                 result.error =
-                    "Install the official Codex CLI first, then try ChatGPT sign-in again.";
+                    "Install the official native Codex CLI first, then try ChatGPT sign-in again.";
                 return result;
             }
 
-            auto status = runProcess({codex.getFullPathName(), "login", "status"});
-            if (status.exitCode != 0 || !status.output.containsIgnoreCase("ChatGPT"))
+            juce::String lockError;
+            if (!acquireCredentialTransaction(job.provider, job.generation,
+                                              job.credentialTransaction, lockError))
             {
-                auto login = runProcess({codex.getFullPathName(), "login"});
-                if (login.exitCode != 0)
+                result.error = lockError;
+                return result;
+            }
+            if (isCancelled(job))
+                return failure(ResultKind::Connection, "The assistant request was cancelled.");
+
+            auto status =
+                runProcess({codex.getFullPathName(), "login", "status"}, job.generation, 15000);
+            if (status.cancelled || status.timedOut)
+            {
+                result.error = status.error;
+                return result;
+            }
+            if (status.exitCode == 0 && !status.output.containsIgnoreCase("ChatGPT"))
+            {
+                result.error =
+                    "Codex already has non-ChatGPT authentication. Sign out of Codex explicitly "
+                    "before connecting ChatGPT Plus.";
+                return result;
+            }
+            if (status.exitCode != 0 && !codexStatusSaysLoggedOut(status))
+            {
+                result.error = "Codex login status could not be determined: " +
+                               sanitizedText(status.output, 300);
+                return result;
+            }
+            job.codexWasLoggedIn =
+                status.exitCode == 0 && status.output.containsIgnoreCase("ChatGPT");
+            if (!job.codexWasLoggedIn)
+            {
+                job.codexLoginAttempted = true;
+                auto login = runProcess({codex.getFullPathName(), "login"}, job.generation, 600000);
+                if (login.cancelled || login.timedOut || login.exitCode != 0)
                 {
-                    result.error = "ChatGPT sign-in failed: " + sanitizedText(login.output, 300);
+                    result.error = login.error.isNotEmpty() ? login.error
+                                                            : "ChatGPT sign-in failed: " +
+                                                                  sanitizedText(login.output, 300);
                     return result;
                 }
-                status = runProcess({codex.getFullPathName(), "login", "status"});
+                status =
+                    runProcess({codex.getFullPathName(), "login", "status"}, job.generation, 15000);
             }
 
-            if (status.exitCode != 0 || !status.output.containsIgnoreCase("ChatGPT"))
+            if (status.cancelled || status.timedOut || status.exitCode != 0 ||
+                !status.output.containsIgnoreCase("ChatGPT"))
             {
                 result.error = "Codex did not report an active ChatGPT subscription login.";
                 return result;
@@ -1013,6 +1693,7 @@ class Client::Impl
             result.models = {providerDefaultModel(Provider::ChatGPT)};
             result.credentialPersistent = true;
             result.ok = true;
+            job.irreversibleMutationCommitted = job.codexLoginAttempted;
             return result;
         }
 
@@ -1023,7 +1704,33 @@ class Client::Impl
             return result;
         }
 
-        auto response = performHttp(providerBaseUrl(job.provider) + "/models", "GET", key);
+        if (job.provider == Provider::OpenRouter)
+        {
+            auto validation = performHttp(job.provider, providerBaseUrl(job.provider) + "/key",
+                                          "GET", key, {}, job.generation);
+            if (validation.error.isNotEmpty())
+            {
+                result.error = validation.error;
+                return result;
+            }
+            if (validation.statusCode < 200 || validation.statusCode >= 300)
+            {
+                result.error = "OpenRouter rejected the connection (HTTP " +
+                               juce::String(validation.statusCode) +
+                               "): " + providerErrorFromBody(validation.body);
+                return result;
+            }
+        }
+
+        auto modelsUrl = providerBaseUrl(job.provider) + "/models";
+        if (job.provider == Provider::Anthropic)
+            modelsUrl = providerBaseUrl(job.provider) + "/v1/models?limit=100";
+        else if (job.provider == Provider::Gemini)
+            modelsUrl = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100";
+        else if (job.provider == Provider::OpenRouter)
+            modelsUrl = providerBaseUrl(job.provider) + "/models/user?limit=1000";
+
+        auto response = performHttp(job.provider, modelsUrl, "GET", key, {}, job.generation);
         if (response.error.isNotEmpty())
         {
             result.error = response.error;
@@ -1038,15 +1745,7 @@ class Client::Impl
         }
 
         juce::String modelError;
-        result.models = parseModelList(response.body, modelError);
-        result.models.erase(std::remove_if(result.models.begin(), result.models.end(),
-                                           [provider = job.provider](auto model) {
-                                               return provider == Provider::DeepSeek
-                                                          ? !model.startsWithIgnoreCase("deepseek-")
-                                                          : !model.startsWithIgnoreCase(
-                                                                "minimax-m");
-                                           }),
-                            result.models.end());
+        result.models = parseModelList(response.body, job.provider, modelError);
         if (result.models.empty())
         {
             result.error = modelError.isNotEmpty()
@@ -1055,19 +1754,36 @@ class Client::Impl
             return result;
         }
 
+        if (isCancelled(job))
+            return failure(ResultKind::Connection, "The assistant request was cancelled.");
+
+        juce::String lockError;
+        if (!acquireCredentialTransaction(job.provider, job.generation, job.credentialTransaction,
+                                          lockError))
+        {
+            result.error = lockError;
+            return result;
+        }
+        if (isCancelled(job))
+            return failure(ResultKind::Connection, "The assistant request was cancelled.");
+
         auto stored = writeCredential(job.provider, key);
         if (!stored.ok)
         {
             result.error = stored.error;
             return result;
         }
+        job.irreversibleMutationCommitted = true;
         result.credentialPersistent = stored.persistent;
         result.ok = true;
         return result;
     }
 
-    Result processDisconnect(const Job &job)
+    Result processDisconnect(Job &job)
     {
+        if (isCancelled(job))
+            return failure(ResultKind::Connection, "The assistant request was cancelled.");
+
         Result result;
         result.kind = ResultKind::Connection;
 
@@ -1079,23 +1795,49 @@ class Client::Impl
                 result.error = "The Codex runtime could not be found.";
                 return result;
             }
-            auto logout = runProcess({codex.getFullPathName(), "logout"});
-            result.ok = logout.exitCode == 0;
+            juce::String lockError;
+            if (!acquireCredentialTransaction(job.provider, job.generation,
+                                              job.credentialTransaction, lockError))
+            {
+                result.error = lockError;
+                return result;
+            }
+            if (isCancelled(job))
+                return failure(ResultKind::Connection, "The assistant request was cancelled.");
+            job.codexLogoutAttempted = true;
+            auto logout = runProcess({codex.getFullPathName(), "logout"}, job.generation, 15000);
+            result.ok = !logout.cancelled && !logout.timedOut && logout.exitCode == 0;
             if (!result.ok)
-                result.error = "ChatGPT sign-out failed: " + sanitizedText(logout.output, 300);
+                result.error = logout.error.isNotEmpty() ? logout.error
+                                                         : "ChatGPT sign-out failed: " +
+                                                               sanitizedText(logout.output, 300);
+            job.irreversibleMutationCommitted = result.ok;
             result.credentialPersistent = true;
             return result;
         }
+
+        juce::String lockError;
+        if (!acquireCredentialTransaction(job.provider, job.generation, job.credentialTransaction,
+                                          lockError))
+        {
+            result.error = lockError;
+            return result;
+        }
+        if (isCancelled(job))
+            return failure(ResultKind::Connection, "The assistant request was cancelled.");
 
         auto erased = eraseCredential(job.provider);
         result.ok = erased.ok;
         result.credentialPersistent = erased.persistent;
         result.error = erased.error;
+        job.irreversibleMutationCommitted = erased.ok;
         return result;
     }
 
     Result processGenerate(const Job &job)
     {
+        if (isCancelled(job))
+            return failure(ResultKind::Generation, "The assistant request was cancelled.");
         if (job.request.provider == Provider::None || job.request.model.isEmpty())
             return failure(ResultKind::Generation,
                            "Select and configure an assistant connection first.");
@@ -1105,7 +1847,13 @@ class Client::Impl
             auto codex = findCodexExecutable();
             if (!codex.existsAsFile())
                 return failure(ResultKind::Generation,
-                               "The official Codex CLI is required for ChatGPT Plus.");
+                               "The official native Codex CLI is required for ChatGPT Plus.");
+
+            CredentialTransactionGuard credentialGuard;
+            juce::String lockError;
+            if (!acquireCredentialTransaction(job.request.provider, job.generation, credentialGuard,
+                                              lockError))
+                return failure(ResultKind::Generation, lockError);
 
             auto temporaryRoot = juce::File::getSpecialLocation(juce::File::tempDirectory)
                                      .getChildFile("surge-xt-assistant-" + juce::Uuid().toString());
@@ -1113,6 +1861,11 @@ class Client::Impl
                 return failure(ResultKind::Generation,
                                "Could not create a private temporary assistant directory.");
             ScopedDirectoryRemoval cleanup(temporaryRoot);
+#if !JUCE_WINDOWS
+            if (::chmod(temporaryRoot.getFullPathName().toRawUTF8(), S_IRWXU) != 0)
+                return failure(ResultKind::Generation,
+                               "Could not secure the temporary assistant directory.");
+#endif
 
             auto promptFile = temporaryRoot.getChildFile("prompt.txt");
             auto schemaFile = temporaryRoot.getChildFile("patch-plan-schema.json");
@@ -1148,7 +1901,7 @@ class Client::Impl
                                         outputFile.getFullPathName(),
                                         temporaryRoot.getFullPathName(),
                                         job.request.model};
-            auto execution = runProcess(arguments);
+            auto execution = runProcess(arguments, job.generation);
             if (execution.exitCode != 0)
                 return failure(ResultKind::Generation,
                                "Codex generation failed: " + sanitizedText(execution.output, 400));
@@ -1164,13 +1917,30 @@ class Client::Impl
 #endif
         }
 
-        auto credential = readCredential(job.request.provider);
+        CredentialResult credential;
+        {
+            CredentialTransactionGuard guard;
+            juce::String lockError;
+            if (!acquireCredentialTransaction(job.request.provider, job.generation, guard,
+                                              lockError))
+                return failure(ResultKind::Generation, lockError);
+            credential = readCredential(job.request.provider);
+        }
         if (!credential.ok)
             return failure(ResultKind::Generation, credential.error);
 
-        auto requestBody = buildChatRequest(job.request);
-        auto response = performHttp(providerBaseUrl(job.request.provider) + "/chat/completions",
-                                    "POST", credential.secret, requestBody);
+        auto protocol = providerProtocol(job.request.provider);
+        auto usesAnthropic = protocol == ProviderProtocol::Anthropic;
+        auto usesOpenAIResponses = protocol == ProviderProtocol::OpenAIResponses;
+        auto requestBody = usesAnthropic         ? buildAnthropicRequest(job.request)
+                           : usesOpenAIResponses ? buildOpenAIResponseRequest(job.request)
+                                                 : buildChatRequest(job.request);
+        auto endpoint =
+            providerBaseUrl(job.request.provider) + (usesAnthropic         ? "/v1/messages"
+                                                     : usesOpenAIResponses ? "/responses"
+                                                                           : "/chat/completions");
+        auto response = performHttp(job.request.provider, endpoint, "POST", credential.secret,
+                                    requestBody, job.generation);
         credential.secret.clear();
         if (response.error.isNotEmpty())
             return failure(ResultKind::Generation, response.error);
@@ -1185,6 +1955,10 @@ class Client::Impl
         std::set<int> allowedIds;
         for (const auto &parameter : job.request.parameters)
             allowedIds.insert(parameter.id);
+        if (usesAnthropic)
+            return parseAnthropicMessage(response.body, job.request.freshPatch, allowedIds);
+        if (usesOpenAIResponses)
+            return parseOpenAIResponse(response.body, job.request.freshPatch, allowedIds);
         return parseChatCompletion(response.body, job.request.freshPatch, allowedIds);
     }
 
@@ -1200,8 +1974,15 @@ class Client::Impl
                     return;
                 job = std::move(jobs.front());
                 jobs.pop_front();
+                activeJob = true;
             }
 
+            auto action = job->type == JobType::Connect
+                              ? juce::String("connect")
+                              : (job->type == JobType::Disconnect ? juce::String("disconnect")
+                                                                  : juce::String("generate"));
+            auto started = juce::Time::getMillisecondCounterHiRes();
+            writeDiagnostic(action, job->provider, "started");
             Result result;
             switch (job->type)
             {
@@ -1215,8 +1996,54 @@ class Client::Impl
                 result = processGenerate(*job);
                 break;
             }
-            job->key.clear();
-            job->promise.set_value(std::move(result));
+            auto elapsed = juce::Time::getMillisecondCounterHiRes() - started;
+            bool succeeded = false;
+            juce::String error;
+            auto publish = [&]() {
+                succeeded = result.ok;
+                error = result.error;
+                job->key.clear();
+                job->credentialTransaction.release();
+                job->promise.set_value(std::move(result));
+                activeJob = false;
+            };
+            bool wasCancelled = false;
+            bool requiresSettlement = false;
+            {
+                std::lock_guard<std::mutex> guard(queueMutex);
+                wasCancelled = isCancelled(*job);
+                auto failedCodexMutation = job->provider == Provider::ChatGPT && !result.ok &&
+                                           (job->codexLoginAttempted || job->codexLogoutAttempted);
+                requiresSettlement =
+                    (wasCancelled && !job->irreversibleMutationCommitted) || failedCodexMutation;
+                if (!requiresSettlement)
+                    publish();
+            }
+            if (requiresSettlement)
+            {
+                auto settlementError = settleCodexCancellation(*job);
+                if (job->irreversibleMutationCommitted)
+                {
+                    result = {};
+                    result.kind = job->kind;
+                    result.ok = true;
+                    result.credentialPersistent = true;
+                }
+                else if (wasCancelled)
+                {
+                    result = failure(job->kind, "The assistant request was cancelled.");
+                    if (settlementError.isNotEmpty())
+                        result.error +=
+                            " The previous authentication state could not be restored: " +
+                            settlementError;
+                }
+                else if (settlementError.isNotEmpty())
+                    result.error += " Authentication cleanup also failed: " + settlementError;
+                std::lock_guard<std::mutex> guard(queueMutex);
+                publish();
+            }
+            writeDiagnostic(action, job->provider, succeeded ? "succeeded" : "failed", elapsed,
+                            error);
         }
     }
 
@@ -1224,6 +2051,8 @@ class Client::Impl
     std::condition_variable queueCondition;
     std::deque<std::unique_ptr<Job>> jobs;
     bool stopping{false};
+    bool activeJob{false};
+    std::atomic<std::uint64_t> cancellationEpoch{0};
     std::thread worker;
 
     std::mutex streamMutex;
@@ -1248,7 +2077,7 @@ std::future<Result> Client::generate(PatchRequest request)
     return impl->generate(std::move(request));
 }
 
-void Client::cancel() { impl->cancel(); }
+bool Client::cancel() { return impl->cancel(); }
 
 } // namespace Assistant
 } // namespace Surge

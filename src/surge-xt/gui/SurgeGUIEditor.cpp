@@ -4109,7 +4109,7 @@ void SurgeGUIEditor::alertBox(const std::string &title, const std::string &promp
     alert->onCancel = std::move(onCancel);
     alert->setBounds(0, 0, getWindowSizeX(), getWindowSizeY());
     alert->setVisible(true);
-    alert->toFront(true);
+    alert->toFront(false);
 }
 
 bool SurgeGUIEditor::modSourceButtonDraggedOver(Surge::Widgets::ModulationSourceButton *msb,
